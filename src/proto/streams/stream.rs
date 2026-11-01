@@ -48,8 +48,20 @@ pub(super) struct Stream {
     /// TODO: Technically this could be greater than the window size...
     pub buffered_send_data: usize,
 
+    /// The padding planned for the DATA frames buffered (see `frame::Data::plan_mut`),
+    /// which takes window as their data does but no capacity the user sees.
+    pub buffered_send_padding: usize,
+
+    /// Whether the DATA frame being written has planned frames left (see
+    /// `frame::Data::plan_mut`), which go once it's reclaimed.
+    pub sending_planned: bool,
+
     /// Task tracking additional send capacity (i.e. window updates).
     send_task: Option<Waker>,
+
+    /// Task waiting for the frames pending for this stream to be sent (see
+    /// `StreamRef::poll_flushed`).
+    flush_task: Option<Waker>,
 
     /// Frames pending for this stream being sent to the socket
     pub pending_send: buffer::Deque,
@@ -73,6 +85,20 @@ pub(super) struct Stream {
     /// Set to true when a push is pending for this stream
     pub is_pending_push: bool,
 
+    /// How its body goes, when as another connection received one (see
+    /// `ext::SendBodyLayout`)
+    pub body_layout: Option<std::sync::Arc<dyn crate::ext::BodyLayout>>,
+
+    /// How many chunks carrying data its body went in so far, when `body_layout` lays it
+    /// out
+    pub body_chunks: u64,
+
+    /// The DATA frames `body_layout` told of that its body didn't reach yet
+    pub body_frames: std::collections::VecDeque<crate::ext::DataFrame>,
+
+    /// The flow-controlled octets of the DATA frames that went on it so far
+    pub data_sent: u64,
+
     // ===== Fields related to receiving =====
     /// Next node in the accept linked list
     pub next_pending_accept: Option<store::Key>,
@@ -84,6 +110,31 @@ pub(super) struct Stream {
     pub recv_flow: FlowControl,
 
     pub in_flight_recv_data: WindowSize,
+
+    /// The data released while the window grows only by relayed WINDOW_UPDATEs (see
+    /// `FlowControl::set_mirror`) that those didn't cover yet.
+    pub mirror_unacked: WindowSize,
+
+    /// Whether the relaying peer is sent the padding received while the window grows only
+    /// by its WINDOW_UPDATEs, which then grow it by that too; else it grows by it here.
+    pub relays_padding: bool,
+
+    /// Before the window grows only by relayed WINDOW_UPDATEs, the data released, and the
+    /// padding among it; after, what the window grew by here for the part the relaying
+    /// peer was sent, which those repay first (see [`Stream::mirror_window`]).
+    pub unmirrored: WindowSize,
+    pub unmirrored_padding: WindowSize,
+
+    /// The data released but the padding the window grew by here, and the part of it
+    /// released while the window grew only by relayed WINDOW_UPDATEs: what of that part
+    /// the relaying peer wasn't sent (see `ext::BodyFrames::relay_sent`) the connection's
+    /// window grows by here should the stream be reset.
+    pub data_taken: u64,
+    pub mirrored_taken: u64,
+
+    /// How far its request's body went on to the relaying peer (see
+    /// `ext::BodyFrames::relay_sent`)
+    pub relayed_body: Option<std::sync::Arc<std::sync::Mutex<crate::ext::RelayedBody>>>,
 
     /// Next node in the linked list of streams waiting to send window updates.
     pub next_window_update: Option<store::Key>,
@@ -170,7 +221,10 @@ impl Stream {
             send_flow,
             requested_send_capacity: 0,
             buffered_send_data: 0,
+            buffered_send_padding: 0,
+            sending_planned: false,
             send_task: None,
+            flush_task: None,
             pending_send: buffer::Deque::new(),
             is_pending_send_capacity: false,
             next_pending_send_capacity: None,
@@ -178,12 +232,23 @@ impl Stream {
             is_pending_open: false,
             next_open: None,
             is_pending_push: false,
+            body_layout: None,
+            body_chunks: 0,
+            body_frames: std::collections::VecDeque::new(),
+            data_sent: 0,
 
             // ===== Fields related to receiving =====
             next_pending_accept: None,
             is_pending_accept: false,
             recv_flow,
             in_flight_recv_data: 0,
+            mirror_unacked: 0,
+            relays_padding: false,
+            unmirrored: 0,
+            unmirrored_padding: 0,
+            data_taken: 0,
+            mirrored_taken: 0,
+            relayed_body: None,
             next_window_update: None,
             is_pending_window_update: false,
             reset_at: None,
@@ -194,6 +259,44 @@ impl Stream {
             push_task: None,
             pending_push_promises: store::Queue::new(),
             content_length: ContentLength::Omitted,
+        }
+    }
+
+    /// Makes the receive window grow only by relayed WINDOW_UPDATEs (see
+    /// `FlowControl::set_mirror`), the relaying peer being sent the padding received if
+    /// `relays_padding`, and returns the data released before, which that peer was sent
+    /// (none once mirrored): what the window grew by here for it is taken back as far as
+    /// not yet announced.
+    pub fn mirror_window(&mut self, relays_padding: bool) -> WindowSize {
+        self.relays_padding = relays_padding;
+        if self.recv_flow.is_mirror() {
+            return 0;
+        }
+        self.recv_flow.set_mirror();
+        if !relays_padding {
+            self.unmirrored = self.unmirrored.saturating_sub(self.unmirrored_padding);
+            self.data_taken = self
+                .data_taken
+                .saturating_sub(u64::from(self.unmirrored_padding));
+        }
+        let sent = self.unmirrored;
+        let unannounced = self
+            .recv_flow
+            .available()
+            .as_size()
+            .saturating_sub(self.recv_flow.window_size());
+        let cancelled = unannounced.min(self.unmirrored);
+        let _res = self.recv_flow.claim_capacity(cancelled);
+        debug_assert!(_res.is_ok());
+        self.unmirrored -= cancelled;
+        sent
+    }
+
+    /// Counts `octets` of data as released (see `Stream::data_taken`).
+    pub fn take_data(&mut self, octets: WindowSize) {
+        self.data_taken += u64::from(octets);
+        if self.recv_flow.is_mirror() {
+            self.mirrored_taken += u64::from(octets);
         }
     }
 
@@ -247,7 +350,9 @@ impl Stream {
             // queue to be rescheduled.
             //
             // Checking for additional buffered data lets us catch this case.
-            self.buffered_send_data == 0
+            self.buffered_send_data == 0 &&
+            // Nor may the empty frames planned after its data have to go yet.
+            !self.sending_planned
     }
 
     /// Returns true if the stream is no longer in use
@@ -300,17 +405,24 @@ impl Stream {
         }
     }
 
-    pub fn send_data(&mut self, len: WindowSize, max_buffer_size: usize) {
+    /// The window its buffered DATA frames take, their planned padding included.
+    pub fn buffered_send_window(&self) -> usize {
+        self.buffered_send_data + self.buffered_send_padding
+    }
+
+    pub fn send_data(&mut self, len: WindowSize, padding: WindowSize, max_buffer_size: usize) {
         let prev_capacity = self.capacity(max_buffer_size);
 
         // TODO: proper error handling
-        let _res = self.send_flow.send_data(len);
+        let _res = self.send_flow.send_data(len + padding);
         debug_assert!(_res.is_ok());
+        self.data_sent += u64::from(len + padding);
 
         // Decrement the stream's buffered data counter
         debug_assert!(self.buffered_send_data >= len as usize);
         self.buffered_send_data -= len as usize;
-        self.requested_send_capacity -= len;
+        self.buffered_send_padding -= padding as usize;
+        self.requested_send_capacity -= len + padding;
 
         tracing::trace!(
             "  sent stream data; available={}; buffered={}; id={:?}; max_buffer_size={} prev={}",
@@ -323,6 +435,14 @@ impl Stream {
 
         if prev_capacity < self.capacity(max_buffer_size) {
             self.notify_capacity();
+        }
+    }
+
+    /// Tells its body's layout, if any, that the rest of its body doesn't go (see
+    /// `ext::BodyLayout::reset`).
+    pub fn reset_layout(&self) {
+        if let Some(layout) = &self.body_layout {
+            layout.reset(self.data_sent);
         }
     }
 
@@ -370,6 +490,17 @@ impl Stream {
         self.send_task = Some(cx.waker().clone());
     }
 
+    /// Wakes the task waiting for this stream's pending frames to be sent.
+    pub fn notify_flushed(&mut self) {
+        if let Some(task) = self.flush_task.take() {
+            task.wake();
+        }
+    }
+
+    pub fn wait_flushed(&mut self, cx: &Context) {
+        self.flush_task = Some(cx.waker().clone());
+    }
+
     pub fn notify_recv(&mut self) {
         if let Some(task) = self.recv_task.take() {
             task.wake();
@@ -404,6 +535,7 @@ impl fmt::Debug for Stream {
             .field("send_flow", &self.send_flow)
             .field("requested_send_capacity", &self.requested_send_capacity)
             .field("buffered_send_data", &self.buffered_send_data)
+            .field("buffered_send_padding", &self.buffered_send_padding)
             .h2_field_some("send_task", &self.send_task.as_ref().map(|_| ()))
             .h2_field_if_then(
                 "pending_send",

@@ -14,6 +14,8 @@ pub struct Settings {
     max_frame_size: Option<u32>,
     max_header_list_size: Option<u32>,
     enable_connect_protocol: Option<u32>,
+    /// The exact parameters to encode, when set by `set_wire`.
+    wire: Option<Vec<(u16, u32)>>,
 }
 
 /// An enum that lists all valid settings that can be sent in a SETTINGS
@@ -52,6 +54,40 @@ pub const MAX_INITIAL_WINDOW_SIZE: usize = (1 << 31) - 1;
 /// MAX_FRAME_SIZE upper bound
 pub const MAX_MAX_FRAME_SIZE: FrameSize = (1 << 24) - 1;
 
+/// The highest MAX_HEADER_LIST_SIZE (the limit when unset) and HEADER_TABLE_SIZE a frame
+/// `set_wire` sets applies, whatever it says.
+const MAX_WIRE_HEADER_LIST_SIZE: u32 = 16 << 20;
+const MAX_WIRE_HEADER_TABLE_SIZE: u32 = 1 << 20;
+
+/// The parameters a connection sends, and applies, for `params`, a SETTINGS frame it
+/// relays or its deferred preface's (`preface`): as given, but HEADER_TABLE_SIZE and
+/// MAX_HEADER_LIST_SIZE past the most `set_wire` applies, and MAX_CONCURRENT_STREAMS past
+/// `max_concurrent_streams`, as those, which a preface's also gets when it has none.
+pub(crate) fn sent_params(
+    params: &[(u16, u32)],
+    max_concurrent_streams: Option<u32>,
+    preface: bool,
+) -> Vec<(u16, u32)> {
+    let mut sent: Vec<(u16, u32)> = params
+        .iter()
+        .map(|&(id, value)| {
+            let max = match id {
+                1 => Some(MAX_WIRE_HEADER_TABLE_SIZE),
+                3 => max_concurrent_streams,
+                6 => Some(MAX_WIRE_HEADER_LIST_SIZE),
+                _ => None,
+            };
+            (id, max.map_or(value, |max| value.min(max)))
+        })
+        .collect();
+    if let Some(max) = max_concurrent_streams {
+        if preface && !params.iter().any(|&(id, _)| id == 3) {
+            sent.push((3, max));
+        }
+    }
+    sent
+}
+
 // ===== impl Settings =====
 
 impl Settings {
@@ -64,6 +100,35 @@ impl Settings {
 
     pub fn is_ack(&self) -> bool {
         self.flags.is_ack()
+    }
+
+    /// Encodes exactly `params`, `(identifier, value)` in order, unknown identifiers and
+    /// repeats included, and takes the known parameters' values from them, the last of a
+    /// repeated one winning, leaving the others unset, MAX_HEADER_LIST_SIZE capped at 16 MiB
+    /// and HEADER_TABLE_SIZE at 1 MiB. An error when a value is invalid.
+    pub fn set_wire(&mut self, params: Vec<(u16, u32)>) -> Result<(), Error> {
+        *self = Settings {
+            flags: self.flags,
+            ..Settings::default()
+        };
+        for &(id, value) in &params {
+            if let Some(setting) = Setting::from_id(id, value) {
+                self.set(setting)?;
+            }
+        }
+        self.header_table_size = self
+            .header_table_size
+            .map(|size| size.min(MAX_WIRE_HEADER_TABLE_SIZE));
+        self.max_header_list_size = self
+            .max_header_list_size
+            .map(|size| size.min(MAX_WIRE_HEADER_LIST_SIZE));
+        self.wire = Some(params);
+        Ok(())
+    }
+
+    /// Drops the parameters `set_wire` gave it to encode, keeping the values it applies.
+    pub(crate) fn clear_wire(&mut self) {
+        self.wire = None;
     }
 
     pub fn initial_window_size(&self) -> Option<u32> {
@@ -126,8 +191,6 @@ impl Settings {
     }
 
     pub fn load(head: Head, payload: &[u8]) -> Result<Settings, Error> {
-        use self::Setting::*;
-
         debug_assert_eq!(head.kind(), crate::frame::Kind::Settings);
 
         if !head.stream_id().is_zero() {
@@ -157,54 +220,65 @@ impl Settings {
         debug_assert!(!settings.flags.is_ack());
 
         for raw in payload.chunks(6) {
-            match Setting::load(raw) {
-                Some(HeaderTableSize(val)) => {
-                    settings.header_table_size = Some(val);
-                }
-                Some(EnablePush(val)) => match val {
-                    0 | 1 => {
-                        settings.enable_push = Some(val);
-                    }
-                    _ => {
-                        return Err(Error::InvalidSettingValue);
-                    }
-                },
-                Some(MaxConcurrentStreams(val)) => {
-                    settings.max_concurrent_streams = Some(val);
-                }
-                Some(InitialWindowSize(val)) => {
-                    if val as usize > MAX_INITIAL_WINDOW_SIZE {
-                        return Err(Error::InvalidSettingValue);
-                    } else {
-                        settings.initial_window_size = Some(val);
-                    }
-                }
-                Some(MaxFrameSize(val)) => {
-                    if DEFAULT_MAX_FRAME_SIZE <= val && val <= MAX_MAX_FRAME_SIZE {
-                        settings.max_frame_size = Some(val);
-                    } else {
-                        return Err(Error::InvalidSettingValue);
-                    }
-                }
-                Some(MaxHeaderListSize(val)) => {
-                    settings.max_header_list_size = Some(val);
-                }
-                Some(EnableConnectProtocol(val)) => match val {
-                    0 | 1 => {
-                        settings.enable_connect_protocol = Some(val);
-                    }
-                    _ => {
-                        return Err(Error::InvalidSettingValue);
-                    }
-                },
-                None => {}
+            if let Some(setting) = Setting::load(raw) {
+                settings.set(setting)?;
             }
         }
 
         Ok(settings)
     }
 
+    fn set(&mut self, setting: Setting) -> Result<(), Error> {
+        use self::Setting::*;
+
+        match setting {
+            HeaderTableSize(val) => {
+                self.header_table_size = Some(val);
+            }
+            EnablePush(val) => match val {
+                0 | 1 => {
+                    self.enable_push = Some(val);
+                }
+                _ => {
+                    return Err(Error::InvalidSettingValue);
+                }
+            },
+            MaxConcurrentStreams(val) => {
+                self.max_concurrent_streams = Some(val);
+            }
+            InitialWindowSize(val) => {
+                if val as usize > MAX_INITIAL_WINDOW_SIZE {
+                    return Err(Error::InvalidSettingValue);
+                } else {
+                    self.initial_window_size = Some(val);
+                }
+            }
+            MaxFrameSize(val) => {
+                if DEFAULT_MAX_FRAME_SIZE <= val && val <= MAX_MAX_FRAME_SIZE {
+                    self.max_frame_size = Some(val);
+                } else {
+                    return Err(Error::InvalidSettingValue);
+                }
+            }
+            MaxHeaderListSize(val) => {
+                self.max_header_list_size = Some(val);
+            }
+            EnableConnectProtocol(val) => match val {
+                0 | 1 => {
+                    self.enable_connect_protocol = Some(val);
+                }
+                _ => {
+                    return Err(Error::InvalidSettingValue);
+                }
+            },
+        }
+        Ok(())
+    }
+
     fn payload_len(&self) -> usize {
+        if let Some(wire) = &self.wire {
+            return wire.len() * 6;
+        }
         let mut len = 0;
         self.for_each(|_| len += 6);
         len
@@ -218,6 +292,14 @@ impl Settings {
         tracing::trace!("encoding SETTINGS; len={}", payload_len);
 
         head.encode(payload_len, dst);
+
+        if let Some(wire) = &self.wire {
+            for &(id, value) in wire {
+                dst.put_u16(id);
+                dst.put_u32(value);
+            }
+            return;
+        }
 
         // Encode the settings
         self.for_each(|setting| {

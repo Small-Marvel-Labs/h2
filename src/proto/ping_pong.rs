@@ -4,11 +4,16 @@ use crate::proto::{self, PingPayload};
 
 use atomic_waker::AtomicWaker;
 use bytes::Buf;
+use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::AsyncWrite;
+use tokio::time::{Instant, Sleep};
 
 /// Acknowledges ping requests from the remote.
 #[derive(Debug)]
@@ -16,6 +21,34 @@ pub(crate) struct PingPong {
     pending_ping: Option<PendingPing>,
     pending_pong: Option<PingPayload>,
     user_pings: Option<UserPingsRx>,
+    /// The payloads of the relayed PINGs sent (see `Relay`) awaiting their ACKs.
+    relayed: Vec<PingPayload>,
+    /// Whether the remote's PINGs await relayed ACKs (see `Relay::relay_acks`), whether
+    /// they go to the relaying peer (those after the first request), and the payloads of
+    /// those it was sent, in the order received, each with what became of it.
+    relays_acks: bool,
+    forwards: bool,
+    awaiting: VecDeque<(PingPayload, Awaiting)>,
+    /// How many of those are due.
+    unacked: usize,
+    /// How many of those awaiting none any longer, unacknowledged, went unkept to bound
+    /// those kept: as many relayed ACKs of none kept still go on.
+    unkept_released: usize,
+    /// Whether none awaits a relayed ACK any longer (see `Relay::release_pings`).
+    released: bool,
+    /// When the earliest due one is no longer.
+    expiry: Option<Pin<Box<Sleep>>>,
+}
+
+/// What became of one of the remote's PINGs the relaying peer was sent.
+#[derive(Debug, Clone, Copy)]
+enum Awaiting {
+    /// It awaits a relayed ACK until then.
+    Due(Instant),
+    /// The connection acknowledged it itself: a relayed ACK of it goes nowhere.
+    Acked,
+    /// It awaits none any longer, unacknowledged: one relayed still goes on.
+    Released,
 }
 
 #[derive(Debug)]
@@ -45,7 +78,21 @@ pub(crate) enum ReceivedPing {
     MustAck,
     Unknown,
     Shutdown,
+    /// The ACK of a relayed PING carrying this payload.
+    Relayed(PingPayload),
+    /// A PING awaiting a relayed ACK.
+    AwaitsRelayedAck,
 }
+
+/// How many of the remote's PINGs may await relayed ACKs: while as many do, the connection
+/// reads no more of its frames (see `PingPong::is_awaiting_full`), and leaves one it reads
+/// all the same awaiting none, its relayed ACK still going on.
+const MAX_AWAITING: usize = 1024;
+
+/// How long one of the remote's PINGs awaits a relayed ACK at most, far longer than a peer
+/// takes to send one: past it, it no longer holds back the connection's reads, left
+/// unacknowledged as the relaying peer left it.
+const PING_ACK_WAIT: Duration = Duration::from_secs(30);
 
 /// No user ping pending.
 const USER_STATE_EMPTY: usize = 0;
@@ -66,7 +113,126 @@ impl PingPong {
             pending_ping: None,
             pending_pong: None,
             user_pings: None,
+            relayed: Vec::new(),
+            relays_acks: false,
+            forwards: false,
+            awaiting: VecDeque::new(),
+            unacked: 0,
+            unkept_released: 0,
+            released: false,
+            expiry: None,
         }
+    }
+
+    /// Makes the remote's PINGs from now on await relayed ACKs, or not, and tells whether
+    /// they go to the relaying peer.
+    pub(crate) fn set_relays_acks(&mut self, relays_acks: bool, forwards: bool) {
+        self.relays_acks = relays_acks;
+        self.forwards = forwards;
+    }
+
+    /// Takes the earliest of the remote's PINGs carrying `payload` the relaying peer was
+    /// sent, whose relayed ACK came: whether that ACK goes on, the connection not having
+    /// acknowledged it itself.
+    pub(crate) fn take_awaiting(&mut self, payload: &PingPayload) -> bool {
+        let Some(index) = self
+            .awaiting
+            .iter()
+            .position(|(awaiting, _)| awaiting == payload)
+        else {
+            // One of those awaiting none any longer that went unkept, as far as any did.
+            if self.unkept_released == 0 {
+                return false;
+            }
+            self.unkept_released -= 1;
+            return true;
+        };
+        match self.awaiting.remove(index).map(|(_, state)| state) {
+            Some(Awaiting::Due(_)) => {
+                self.unacked -= 1;
+                true
+            }
+            Some(Awaiting::Released) => true,
+            Some(Awaiting::Acked) | None => false,
+        }
+    }
+
+    /// The payload of the remote's earliest PING awaiting a relayed ACK.
+    pub(crate) fn first_awaiting(&self) -> Option<PingPayload> {
+        if self.unacked == 0 {
+            return None;
+        }
+        self.awaiting
+            .iter()
+            .find(|(_, state)| matches!(state, Awaiting::Due(_)))
+            .map(|(payload, _)| *payload)
+    }
+
+    /// Whether as many of the remote's PINGs as may await relayed ACKs do.
+    pub(crate) fn is_awaiting_full(&self) -> bool {
+        self.unacked >= MAX_AWAITING
+    }
+
+    /// Notes that the remote's earliest PING awaiting a relayed ACK is acknowledged.
+    pub(crate) fn ack_awaiting(&mut self) {
+        if let Some((_, state)) = self
+            .awaiting
+            .iter_mut()
+            .find(|(_, state)| matches!(state, Awaiting::Due(_)))
+        {
+            *state = Awaiting::Acked;
+            self.unacked -= 1;
+        }
+    }
+
+    /// Leaves the remote's PINGs awaiting relayed ACKs, and those it sends from now on,
+    /// unacknowledged (see `Relay::release_pings`).
+    pub(crate) fn release_awaiting(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        self.release_due(None);
+    }
+
+    /// Releases the remote's PINGs that awaited a relayed ACK for `PING_ACK_WAIT`, `cx`
+    /// woken once the next one did.
+    pub(crate) fn poll_expired(&mut self, cx: &mut Context) {
+        while self.unacked != 0 {
+            if let Some(expiry) = &mut self.expiry {
+                if expiry.as_mut().poll(cx).is_pending() {
+                    return;
+                }
+            }
+            self.release_due(Some(Instant::now()));
+        }
+        self.expiry = None;
+    }
+
+    /// Releases the remote's PINGs due by `now` (all of them for `None`), and notes when
+    /// the earliest still due is no longer.
+    fn release_due(&mut self, now: Option<Instant>) {
+        self.expiry = None;
+        for (_, state) in &mut self.awaiting {
+            if let Awaiting::Due(until) = *state {
+                if matches!(now, Some(now) if until > now) {
+                    self.expiry = Some(Box::pin(tokio::time::sleep_until(until)));
+                    return;
+                }
+                *state = Awaiting::Released;
+                self.unacked -= 1;
+            }
+        }
+    }
+
+    /// Notes a relayed PING carrying `payload` just sent, which awaits its ACK.
+    pub(crate) fn sent_relayed(&mut self, payload: PingPayload) {
+        self.relayed.push(payload);
+    }
+
+    /// How many relayed PINGs sent await their ACKs.
+    pub(crate) fn relayed_waiting(&self) -> usize {
+        self.relayed.len()
     }
 
     /// Can only be called once. If called a second time, returns `None`.
@@ -122,12 +288,46 @@ impl PingPong {
                 }
             }
 
+            if let Some(index) = self.relayed.iter().position(|sent| sent == ping.payload()) {
+                return ReceivedPing::Relayed(self.relayed.remove(index));
+            }
+
             // else we were acked a ping we didn't send?
             // The spec doesn't require us to do anything about this,
             // so for resiliency, just ignore it for now.
             tracing::warn!("recv PING ack that we never sent: {:?}", ping);
             ReceivedPing::Unknown
+        } else if self.relays_acks {
+            if !self.released {
+                // One read past as many as may await relayed ACKs (see
+                // `Connection::poll_relay`) awaits none, left unacknowledged here.
+                let state = if self.is_awaiting_full() {
+                    Awaiting::Released
+                } else {
+                    self.unacked += 1;
+                    Awaiting::Due(Instant::now() + PING_ACK_WAIT)
+                };
+                self.awaiting.push_back((ping.into_payload(), state));
+                // Those no longer due go first.
+                if self.awaiting.len() > 2 * MAX_AWAITING {
+                    if let Some(at) = self
+                        .awaiting
+                        .iter()
+                        .position(|(_, state)| !matches!(state, Awaiting::Due(_)))
+                    {
+                        if let Some((_, Awaiting::Released)) = self.awaiting.remove(at) {
+                            self.unkept_released += 1;
+                        }
+                    }
+                }
+            }
+            ReceivedPing::AwaitsRelayedAck
         } else {
+            // The relaying peer, which it went to, acknowledges it too (see
+            // `take_awaiting`).
+            if self.forwards && self.awaiting.len() < MAX_AWAITING {
+                self.awaiting.push_back((*ping.payload(), Awaiting::Acked));
+            }
             // Save the ping's payload to be sent as an acknowledgement.
             self.pending_pong = Some(ping.into_payload());
             ReceivedPing::MustAck
@@ -195,12 +395,6 @@ impl PingPong {
         }
 
         Poll::Ready(Ok(()))
-    }
-}
-
-impl ReceivedPing {
-    pub(crate) fn is_shutdown(&self) -> bool {
-        matches!(*self, Self::Shutdown)
     }
 }
 

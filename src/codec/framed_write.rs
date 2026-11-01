@@ -5,6 +5,8 @@ use crate::hpack;
 
 use bytes::{Buf, BufMut, BytesMut};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::io::poll_write_buf;
@@ -25,7 +27,12 @@ pub struct FramedWrite<T, B> {
     inner: T,
     final_flush_done: bool,
 
+    hold: Hold,
+
     encoder: Encoder<B>,
+
+    /// Counts the bytes written to `inner`, when set (see `count_written`).
+    written: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug)]
@@ -52,6 +59,15 @@ struct Encoder<B> {
 
     /// Min buffer required to attempt to write a frame
     min_buffer_capacity: usize,
+}
+
+/// Whether writes are held back (see `FramedWrite::hold`), and the bytes to write ahead
+/// of the buffered frames once released.
+#[derive(Debug)]
+enum Hold {
+    Open,
+    Held,
+    Releasing(BytesMut),
 }
 
 #[derive(Debug)]
@@ -91,6 +107,8 @@ where
         FramedWrite {
             inner,
             final_flush_done: false,
+            hold: Hold::Open,
+            written: None,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
                 buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
@@ -134,10 +152,31 @@ where
         self.encoder.buffer(item)
     }
 
+    /// Buffers `frame`, a whole encoded frame, as is.
+    pub fn buffer_raw(&mut self, frame: &[u8]) {
+        assert!(self.encoder.has_capacity());
+        self.encoder.buf.get_mut().put_slice(frame);
+    }
+
     /// Flush buffered data to the wire
     pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         let span = tracing::trace_span!("FramedWrite::flush");
         let _e = span.enter();
+
+        match &mut self.hold {
+            Hold::Open => {}
+            Hold::Held => return Poll::Ready(Ok(())),
+            Hold::Releasing(front) => {
+                while front.has_remaining() {
+                    let n = ready!(poll_write_buf(Pin::new(&mut self.inner), cx, front))?;
+                    if n == 0 {
+                        return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                    }
+                    count(&self.written, n);
+                }
+                self.hold = Hold::Open;
+            }
+        }
 
         loop {
             while !self.encoder.is_empty() {
@@ -161,6 +200,7 @@ where
                     tracing::trace!("write returned zero, but non-zero bytes remaining");
                     return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                 }
+                count(&self.written, n);
             }
 
             match self.encoder.unset_frame() {
@@ -233,11 +273,11 @@ where
                 // Ensure that the payload is not greater than the max frame.
                 let len = v.payload().remaining();
 
-                if len > self.max_frame_size() {
+                if len + v.padding_len() > self.max_frame_size() {
                     return Err(PayloadTooBig);
                 }
 
-                if len >= self.chain_threshold {
+                if len >= self.chain_threshold && v.padding_len() == 0 {
                     let head = v.head();
 
                     // Encode the frame head to the buffer
@@ -307,9 +347,11 @@ where
     }
 
     fn has_capacity(&self) -> bool {
+        // Bounded by the buffer's initial capacity, not its current one: a frame copied in
+        // past that (HEADERS, SETTINGS, a relayed frame) grows the buffer for good. The
+        // octets written stay counted until all went.
         self.next.is_none()
-            && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
-                >= self.min_buffer_capacity)
+            && self.buf.get_ref().len() + self.min_buffer_capacity <= DEFAULT_BUFFER_CAPACITY
     }
 
     fn is_empty(&self) -> bool {
@@ -327,6 +369,22 @@ impl<B> Encoder<B> {
 }
 
 impl<T, B> FramedWrite<T, B> {
+    /// Counts the bytes it writes from now on in `counter`.
+    pub(crate) fn count_written(&mut self, counter: Arc<AtomicU64>) {
+        self.written = Some(counter);
+    }
+
+    /// Holds every write back: frames buffer but nothing reaches the wire until
+    /// `release`.
+    pub fn hold(&mut self) {
+        self.hold = Hold::Held;
+    }
+
+    /// Ends a `hold`: `front` goes to the wire first, then the frames buffered meanwhile.
+    pub fn release(&mut self, front: BytesMut) {
+        self.hold = Hold::Releasing(front);
+    }
+
     /// Returns the max frame size that can be sent
     pub fn max_frame_size(&self) -> usize {
         self.encoder.max_frame_size()
@@ -374,5 +432,12 @@ mod unstable {
         pub fn get_ref(&self) -> &T {
             &self.inner
         }
+    }
+}
+
+/// Adds `n` bytes written to `written`, when counting.
+fn count(written: &Option<Arc<AtomicU64>>, n: usize) {
+    if let Some(written) = written {
+        written.fetch_add(n as u64, Ordering::Relaxed);
     }
 }

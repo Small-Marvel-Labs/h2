@@ -49,6 +49,7 @@ mod util;
 mod window_update;
 
 pub use self::data::Data;
+pub(crate) use self::data::PlannedFrame;
 pub use self::go_away::GoAway;
 pub use self::head::{Head, Kind};
 pub use self::headers::{
@@ -58,6 +59,7 @@ pub use self::ping::Ping;
 pub use self::priority::{Priority, StreamDependency};
 pub use self::reason::Reason;
 pub use self::reset::Reset;
+pub(crate) use self::settings::sent_params;
 pub use self::settings::Settings;
 pub use self::stream_id::{StreamId, StreamIdOverflow};
 pub use self::window_update::WindowUpdate;

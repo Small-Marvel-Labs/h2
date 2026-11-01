@@ -59,6 +59,27 @@ where
 }
 
 impl<T, B> Codec<T, B> {
+    /// Logs every frame the peer sends but DATA to `log`.
+    pub(crate) fn set_frame_log(&mut self, log: crate::ext::FrameLog) {
+        self.inner.set_frame_log(log)
+    }
+
+    /// Counts the bytes it writes to the peer from now on in `counter`.
+    pub(crate) fn count_written(&mut self, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        self.framed_write().count_written(counter)
+    }
+
+    /// Holds every write back until `release`.
+    pub(crate) fn hold_writes(&mut self) {
+        self.framed_write().hold()
+    }
+
+    /// Ends `hold_writes`: `front` goes to the wire first, then the frames buffered
+    /// meanwhile.
+    pub(crate) fn release_writes(&mut self, front: bytes::BytesMut) {
+        self.framed_write().release(front)
+    }
+
     /// Updates the max received frame size.
     ///
     /// The change takes effect the next time a frame is decoded. In other
@@ -150,6 +171,11 @@ where
     /// TODO: Rename this to avoid conflicts with Sink::buffer
     pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
         self.framed_write().buffer(item)
+    }
+
+    /// Buffers `frame`, a whole encoded frame, as is; `poll_ready` must be called first.
+    pub(crate) fn buffer_raw(&mut self, frame: &[u8]) {
+        self.framed_write().buffer_raw(frame)
     }
 
     /// Flush buffered data to the wire

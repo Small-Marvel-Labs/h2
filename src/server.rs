@@ -116,6 +116,7 @@
 //! [`TcpListener`]: https://docs.rs/tokio-core/0.1/tokio_core/net/struct.TcpListener.html
 
 use crate::codec::{Codec, UserError};
+use crate::ext::{HeaderBlockEncoding, HeaderOrder};
 use crate::frame::{self, Pseudo, PushPromiseHeaderError, Reason, Settings, StreamId};
 use crate::proto::{self, Config, Error, Prioritized};
 use crate::{FlowControl, PingPong, RecvStream, SendStream};
@@ -195,6 +196,9 @@ pub struct Handshake<T, B: Buf = Bytes> {
 #[must_use = "streams do nothing unless polled"]
 pub struct Connection<T, B: Buf> {
     connection: proto::Connection<T, Peer, B>,
+    /// The error the connection ended with, while the requests received before it still go
+    /// to the caller (see [`Connection::poll_accept`]).
+    ended: Option<crate::Error>,
 }
 
 /// Builds server connections with custom configuration values.
@@ -263,6 +267,18 @@ pub struct Builder {
     ///
     /// When this gets exhausted, we issue a GOAWAY with `ENHANCE_YOUR_CALM`.
     data_frame_budget: proto::DataFrameBudget,
+
+    /// How many of the client's frames to log per connection, when recording them.
+    frame_log_limit: Option<usize>,
+
+    /// The preface to send once supplied, instead of one at the handshake.
+    deferred_preface: Option<crate::ext::DeferredPreface>,
+
+    /// Whether a client's GOAWAY leaves closing the connection to the client.
+    leave_close_to_client: bool,
+
+    /// The end of another connection to end the connection as.
+    relayed_end: Option<crate::ext::RelayedEnd>,
 }
 
 /// Send a response back to the client
@@ -392,18 +408,40 @@ where
             codec.set_max_recv_frame_size(max as usize);
         }
 
-        if let Some(max) = builder.settings.max_header_list_size() {
+        // Beneath a deferred preface, the client is told none until the preface's SETTINGS.
+        if let Some(max) = builder
+            .settings
+            .max_header_list_size()
+            .filter(|_| builder.deferred_preface.is_none())
+        {
             codec.set_max_recv_header_list_size(max as usize);
         }
 
-        // Send initial settings frame.
-        codec
-            .buffer(builder.settings.clone().into())
-            .expect("invalid SETTINGS frame");
+        if let Some(limit) = builder.frame_log_limit {
+            let log = match &builder.deferred_preface {
+                Some(preface) => {
+                    let log = preface.frame_log();
+                    log.set_limit(limit);
+                    log
+                }
+                None => crate::ext::FrameLog::new(limit),
+            };
+            codec.set_frame_log(log);
+        }
 
-        // Create the handshake future.
-        let state =
-            Handshaking::Flushing(Flush::new(codec).instrument(tracing::trace_span!("flush")));
+        // Send initial settings frame, unless it is deferred: then nothing goes out until
+        // the preface arrives.
+        let state = if builder.deferred_preface.is_some() {
+            codec.hold_writes();
+            Handshaking::ReadingPreface(
+                ReadPreface::new(codec).instrument(tracing::trace_span!("read_preface")),
+            )
+        } else {
+            codec
+                .buffer(builder.settings.clone().into())
+                .expect("invalid SETTINGS frame");
+            Handshaking::Flushing(Flush::new(codec).instrument(tracing::trace_span!("flush")))
+        };
 
         drop(entered);
 
@@ -428,14 +466,26 @@ where
     ) -> Poll<Option<Result<(Request<RecvStream>, SendResponse<B>), crate::Error>>> {
         // Always try to advance the internal state. Getting Pending also is
         // needed to allow this function to return Pending.
-        if self.poll_closed(cx)?.is_ready() {
-            // If the socket is closed, don't return anything
-            // TODO: drop any pending streams
-            return Poll::Ready(None);
-        }
-
-        if let Some(inner) = self.connection.next_incoming() {
+        let closed = match self.ended.take() {
+            Some(error) => Poll::Ready(Err(error)),
+            None => self.poll_closed(cx),
+        };
+        // The requests received before its transport ended still go, ahead of its end,
+        // unless its peer reset it.
+        let incoming = match &closed {
+            Poll::Ready(Err(error)) => match error.get_io().map(std::io::Error::kind) {
+                Some(kind) if kind != std::io::ErrorKind::ConnectionReset => {
+                    self.connection.next_incoming()
+                }
+                _ => None,
+            },
+            _ => self.connection.next_incoming(),
+        };
+        if let Some(inner) = incoming {
             tracing::trace!("received incoming");
+            if let Poll::Ready(Err(error)) = closed {
+                self.ended = Some(error);
+            }
             let (head, _) = inner.take_request().into_parts();
             let body = RecvStream::new(FlowControl::new(inner.clone_to_opaque()));
 
@@ -445,7 +495,9 @@ where
             return Poll::Ready(Some(Ok((request, respond))));
         }
 
-        Poll::Pending
+        // If the socket is closed, don't return anything
+        ready!(closed)?;
+        Poll::Ready(None)
     }
 
     /// Sets the target window size for the whole connection.
@@ -662,7 +714,63 @@ impl Builder {
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             data_frame_budget: proto::DataFrameBudget::Auto,
+            frame_log_limit: None,
+            deferred_preface: None,
+            leave_close_to_client: false,
+            relayed_end: None,
         }
+    }
+
+    /// Records the frames each client sends that shape its HTTP/2 fingerprint.
+    ///
+    /// Each connection logs the client's frames but DATA, in the order received, up to
+    /// `limit` of them, in a [`FrameLog`](crate::ext::FrameLog), and each request carries a
+    /// [`HeadersFrame`](crate::ext::HeadersFrame) extension with its HEADERS frame's stream,
+    /// priority fields and pseudo-header order, and that log.
+    ///
+    /// Not recorded by default.
+    pub fn record_frames(&mut self, limit: usize) -> &mut Self {
+        self.frame_log_limit = Some(limit);
+        self
+    }
+
+    /// Sends the connection preface `preface` supplies instead of this builder's SETTINGS
+    /// at the handshake: the connection reads the client's preface and frames meanwhile,
+    /// and sends nothing (no SETTINGS, ACK, WINDOW_UPDATE or response) until the preface
+    /// arrives, which it then writes ahead of everything else. The connection window
+    /// then grows only by the preface's WINDOW_UPDATE, not
+    /// [`initial_connection_window_size`](Self::initial_connection_window_size), and the
+    /// client's header lists are bounded by the preface's SETTINGS once acknowledged, not
+    /// [`max_header_list_size`](Self::max_header_list_size). Its
+    /// [`max_concurrent_streams`](Self::max_concurrent_streams) still bounds the preface's
+    /// (see [`sent_settings`](crate::ext::sent_settings)).
+    ///
+    /// Lets a server reproduce another server's preface, once known.
+    pub fn deferred_preface(&mut self, preface: crate::ext::DeferredPreface) -> &mut Self {
+        self.deferred_preface = Some(preface);
+        self
+    }
+
+    /// Leaves closing the connection to the client once it sent a GOAWAY: the connection
+    /// stays open, sending no GOAWAY of its own, after the client's streams are done, until
+    /// the client closes it.
+    ///
+    /// Lets an intermediary relaying the client's GOAWAY leave its answer to the server it
+    /// relays to. By default the connection answers with its own GOAWAY and closes.
+    pub fn leave_close_to_client(&mut self) -> &mut Self {
+        self.leave_close_to_client = true;
+        self
+    }
+
+    /// Ends the connection as `end` relays another connection's end: it sends the GOAWAYs
+    /// `end` relays, then closes once it has no streams when `end` says so, with no GOAWAY
+    /// of its own (see [`RelayedEnd`](crate::ext::RelayedEnd)).
+    ///
+    /// Lets an intermediary end a client's connection as the server it relays to ended its
+    /// own.
+    pub fn relayed_end(&mut self, end: crate::ext::RelayedEnd) -> &mut Self {
+        self.relayed_end = Some(end);
+        self
     }
 
     /// Indicates the initial window size (in octets) for stream-level
@@ -1187,7 +1295,7 @@ impl<B: Buf> SendResponse<B> {
     /// - The response status code is not in the 1xx range
     /// - The final response has already been sent
     /// - There is a connection-level error
-    pub fn send_informational(&mut self, response: Response<()>) -> Result<(), crate::Error> {
+    pub fn send_informational(&mut self, mut response: Response<()>) -> Result<(), crate::Error> {
         let stream_id = self.inner.stream_id();
         let status = response.status();
 
@@ -1214,9 +1322,14 @@ impl<B: Buf> SendResponse<B> {
             stream_id
         );
 
-        let frame = Peer::convert_send_message(
-            stream_id, response, false, // NOT end_of_stream for informational responses
+        let order = response.extensions_mut().remove::<HeaderOrder>();
+        let encoding = response.extensions_mut().remove::<HeaderBlockEncoding>();
+        let mut frame = Peer::convert_send_message(
+            stream_id, response, order, false, // NOT end_of_stream for informational responses
         );
+        if let Some(encoding) = encoding {
+            frame.set_encoding(encoding);
+        }
 
         tracing::trace!(
             "sending interim informational headers frame for stream: {:?}",
@@ -1324,6 +1437,13 @@ impl<B: Buf> SendResponse<B> {
         self.inner.poll_reset(cx, proto::PollReset::AwaitingHeaders)
     }
 
+    /// Polls until fewer than 1,024 frames wait on the stream to be handed to the
+    /// connection, so that informational responses aren't queued without bound toward
+    /// a peer that reads none of them.
+    pub fn poll_queue_room(&mut self, cx: &mut Context) -> Poll<()> {
+        self.inner.poll_queue_room(cx)
+    }
+
     /// Returns the stream ID of the response stream.
     ///
     /// # Panics
@@ -1394,6 +1514,14 @@ impl<B: Buf> SendPushedResponse<B> {
     /// a user error.
     pub fn poll_reset(&mut self, cx: &mut Context) -> Poll<Result<Reason, crate::Error>> {
         self.inner.poll_reset(cx)
+    }
+
+    /// Polls until the frames sent on the pushed stream so far have all been handed to
+    /// the connection to write, so that a frame sent afterwards on another stream goes out
+    /// after them, or until they wait for the stream to be opened, which waits on other
+    /// streams closing (the client's `SETTINGS_MAX_CONCURRENT_STREAMS`).
+    pub fn poll_flushed(&mut self, cx: &mut Context) -> Poll<()> {
+        self.inner.inner.poll_flushed(cx)
     }
 
     /// Returns the stream ID of the response stream.
@@ -1518,6 +1646,7 @@ where
                     let codec = ready!(Pin::new(read).poll(cx)?);
 
                     self.state = Handshaking::Done;
+                    let deferred = self.builder.deferred_preface.is_some();
 
                     let connection = proto::Connection::new(
                         codec,
@@ -1537,13 +1666,21 @@ where
                                 .builder
                                 .data_frame_budget
                                 .resolve(self.builder.initial_target_connection_window_size),
+                            deferred_preface: self.builder.deferred_preface.clone(),
+                            leave_close_to_client: self.builder.leave_close_to_client,
+                            relayed_end: self.builder.relayed_end.clone(),
                         },
                     );
 
                     tracing::trace!("connection established!");
-                    let mut c = Connection { connection };
+                    let mut c = Connection {
+                        connection,
+                        ended: None,
+                    };
                     if let Some(sz) = self.builder.initial_target_connection_window_size {
-                        c.set_target_window_size(sz);
+                        if !deferred {
+                            c.set_target_window_size(sz);
+                        }
                     }
 
                     return Poll::Ready(Ok(c));
@@ -1570,6 +1707,7 @@ impl Peer {
     pub fn convert_send_message(
         id: StreamId,
         response: Response<()>,
+        order: Option<HeaderOrder>,
         end_of_stream: bool,
     ) -> frame::Headers {
         use http::response::Parts;
@@ -1588,6 +1726,9 @@ impl Peer {
 
         // Create the HEADERS frame
         let mut frame = frame::Headers::new(id, pseudo, headers);
+        if let Some(order) = order {
+            frame.set_header_order(order);
+        }
 
         if end_of_stream {
             frame.set_end_stream()
@@ -1684,10 +1825,12 @@ impl proto::Peer for Peer {
         }
 
         let has_protocol = pseudo.protocol.is_some();
-        if has_protocol {
-            if is_connect {
+        if let Some(protocol) = pseudo.protocol {
+            if !protocol.is_token() {
+                malformed!("malformed headers: :protocol not a token");
+            } else if is_connect {
                 // Assert that we have the right type.
-                b = b.extension::<crate::ext::Protocol>(pseudo.protocol.unwrap());
+                b = b.extension::<crate::ext::Protocol>(protocol);
             } else {
                 malformed!("malformed headers: :protocol on non-CONNECT request");
             }

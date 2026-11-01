@@ -1,5 +1,6 @@
 use super::*;
 use crate::codec::UserError;
+use crate::ext::{HeaderOrder, Refund, Relay, RelayedBody};
 use crate::frame::{PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
 use crate::proto;
 
@@ -20,6 +21,9 @@ pub(super) struct Recv {
 
     /// Amount of connection window capacity currently used by outstanding streams.
     in_flight_data: WindowSize,
+
+    /// The task waiting for room among the data received (see [`Recv::poll_buffered_room`]).
+    buffered_task: Option<Waker>,
 
     /// The lowest stream ID that is still idle
     next_stream_id: Result<StreamId, StreamIdOverflow>,
@@ -57,6 +61,25 @@ pub(super) struct Recv {
     /// If push promises are allowed to be received.
     is_push_enabled: bool,
 
+    /// The data the client's mirrored streams released (see `FlowControl::set_mirror`),
+    /// less what their resets gave back to the connection: the relaying peer's
+    /// connection WINDOW_UPDATEs cover it once it went on to that peer.
+    mirror_covered: u64,
+
+    /// What the relayed connection WINDOW_UPDATEs kept back of their increments (see
+    /// [`Self::relayed_connection_increment`]).
+    relay_repaid: u64,
+
+    /// The window the connection announced for data the client's streams released before
+    /// they were mirrored, which the relayed connection WINDOW_UPDATEs still keep back (see
+    /// [`Self::mirror_released`]).
+    mirror_announced: u64,
+
+    /// Whether the WINDOW_UPDATEs due wait for a deferred preface, which no frame goes
+    /// ahead of: the windows they would grow may yet come to grow only by the relaying
+    /// peer's (see `Stream::mirror_window`).
+    pub windows_held: bool,
+
     /// If extended connect protocol is enabled.
     is_extended_connect_protocol_enabled: bool,
 }
@@ -65,7 +88,7 @@ pub(super) struct Recv {
 pub(super) enum Event {
     Headers(peer::PollMessage),
     Data(DataEvent),
-    Trailers(HeaderMap),
+    Trailers(HeaderMap, HeaderOrder),
     InformationalHeaders(peer::PollMessage),
 }
 
@@ -80,6 +103,11 @@ pub(super) enum RecvHeaderBlockError<T> {
     Oversize(T),
     State(Error),
 }
+
+/// How many octets of the data received a connection holds unreleased before it reads no
+/// more frames (see [`Recv::poll_buffered_room`]): relayed windows can be far larger, and a
+/// caller passing the data on to a peer slower to take it would otherwise hold all of it.
+const BUFFERED_DATA: WindowSize = 16 << 20;
 
 #[derive(Debug)]
 pub(crate) enum Open {
@@ -103,6 +131,7 @@ impl Recv {
             init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
             flow,
             in_flight_data: 0 as WindowSize,
+            buffered_task: None,
             next_stream_id: Ok(next_stream_id.into()),
             pending_window_updates: store::Queue::new(),
             last_processed_id: StreamId::ZERO,
@@ -114,6 +143,10 @@ impl Recv {
             refused: None,
             is_push_enabled: config.local_push_enabled,
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
+            mirror_covered: 0,
+            relay_repaid: 0,
+            mirror_announced: 0,
+            windows_held: false,
         }
     }
 
@@ -161,7 +194,7 @@ impl Recv {
     /// The caller ensures that the frame represents headers and not trailers.
     pub fn recv_headers(
         &mut self,
-        frame: frame::Headers,
+        mut frame: frame::Headers,
         stream: &mut store::Ptr,
         counts: &mut Counts,
     ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
@@ -241,6 +274,8 @@ impl Recv {
         }
 
         let stream_id = frame.stream_id();
+        let order = frame.take_header_order();
+        let received = frame.take_received();
         let (pseudo, fields) = frame.into_parts();
 
         if pseudo.protocol.is_some()
@@ -257,9 +292,13 @@ impl Recv {
         }
 
         if !pseudo.is_informational() {
-            let message = counts
+            let mut message = counts
                 .peer()
-                .convert_poll_message(pseudo, fields, stream_id)?;
+                .convert_poll_message(pseudo, fields, order, stream_id)?;
+            if let (peer::PollMessage::Server(req), Some(received)) = (&mut message, received) {
+                stream.relayed_body = Some(received.body.relayed());
+                req.extensions_mut().insert(received);
+            }
 
             // Push the frame onto the stream's recv buffer
             stream
@@ -279,7 +318,7 @@ impl Recv {
             // Convert to response and store it for polling
             let message = counts
                 .peer()
-                .convert_poll_message(pseudo, fields, stream_id)?;
+                .convert_poll_message(pseudo, fields, order, stream_id)?;
 
             tracing::trace!("Received informational response: stream_id={:?}", stream_id);
 
@@ -418,7 +457,7 @@ impl Recv {
     /// Transition the stream based on receiving trailers
     pub fn recv_trailers(
         &mut self,
-        frame: frame::Headers,
+        mut frame: frame::Headers,
         stream: &mut store::Ptr,
     ) -> Result<(), Error> {
         // Transition the state
@@ -429,15 +468,36 @@ impl Recv {
             return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
         }
 
+        let order = frame.take_header_order();
         let trailers = frame.into_fields();
 
         // Push the frame onto the stream's recv buffer
         stream
             .pending_recv
-            .push_back(&mut self.buffer, Event::Trailers(trailers));
+            .push_back(&mut self.buffer, Event::Trailers(trailers, order));
         stream.notify_recv();
 
         Ok(())
+    }
+
+    /// Ready once the data received and not yet released is less than [`BUFFERED_DATA`].
+    pub fn poll_buffered_room(&mut self, cx: &Context) -> Poll<()> {
+        if self.in_flight_data < BUFFERED_DATA {
+            return Poll::Ready(());
+        }
+        self.buffered_task = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    /// Counts `capacity` of the data received as released, waking the task waiting for room
+    /// among it.
+    fn release_in_flight(&mut self, capacity: WindowSize) {
+        self.in_flight_data -= capacity;
+        if self.in_flight_data < BUFFERED_DATA {
+            if let Some(task) = self.buffered_task.take() {
+                task.wake();
+            }
+        }
     }
 
     /// Releases capacity of the connection
@@ -449,9 +509,12 @@ impl Recv {
         );
 
         // Decrement in-flight data
-        self.in_flight_data -= capacity;
+        self.release_in_flight(capacity);
 
-        // Assign capacity to connection
+        self.assign_connection_capacity(capacity, task);
+    }
+
+    fn assign_connection_capacity(&mut self, capacity: WindowSize, task: &mut Option<Waker>) {
         // TODO: proper error handling
         let _res = self.flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
@@ -475,11 +538,22 @@ impl Recv {
         if capacity > stream.in_flight_recv_data {
             return Err(UserError::ReleaseCapacityTooBig);
         }
+        stream.take_data(capacity);
+
+        if stream.recv_flow.is_mirror() {
+            // The relayed peer's WINDOW_UPDATEs grow the windows instead.
+            self.release_in_flight(capacity);
+            stream.in_flight_recv_data -= capacity;
+            stream.mirror_unacked = stream.mirror_unacked.saturating_add(capacity);
+            self.mirror_covered += u64::from(capacity);
+            return Ok(());
+        }
 
         self.release_connection_capacity(capacity, task);
 
         // Decrement in-flight data
         stream.in_flight_recv_data -= capacity;
+        stream.unmirrored = stream.unmirrored.saturating_add(capacity);
 
         // Assign capacity to stream
         // TODO: proper error handling
@@ -498,10 +572,44 @@ impl Recv {
         Ok(())
     }
 
-    /// Release any unclaimed capacity for a closed stream.
+    /// Grows mirrored `stream`'s window (see `FlowControl::set_mirror`), and the
+    /// connection's, by `padding` octets of the padding it received and released that the
+    /// relaying peer isn't sent, whose WINDOW_UPDATEs never grow them by it, less the window
+    /// each announced ahead for data released before it was mirrored that those were to
+    /// repay (see `Self::give_back` and `Stream::mirror_window`).
+    pub fn release_mirrored_padding(
+        &mut self,
+        padding: WindowSize,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) {
+        let padding = padding.min(stream.mirror_unacked);
+        if padding == 0 {
+            return;
+        }
+        stream.mirror_unacked -= padding;
+        stream.data_taken = stream.data_taken.saturating_sub(u64::from(padding));
+        stream.mirrored_taken = stream.mirrored_taken.saturating_sub(u64::from(padding));
+        self.give_back(u64::from(padding), task);
+        let repaid = padding.min(stream.unmirrored);
+        stream.unmirrored -= repaid;
+        // TODO: proper error handling
+        let _res = stream.recv_flow.assign_capacity(padding - repaid);
+        debug_assert!(_res.is_ok());
+        if stream.recv_flow.unclaimed_capacity().is_some() {
+            self.pending_window_updates.push(stream);
+        }
+        if let Some(task) = task.take() {
+            task.wake();
+        }
+    }
+
+    /// Release any unclaimed capacity for a closed stream, `relay` relaying the data it
+    /// released.
     pub fn release_closed_capacity(
         &mut self,
         stream: &mut store::Ptr,
+        relay: Option<&Relay>,
         task: &mut Option<Waker>,
         counts: &mut Counts,
     ) {
@@ -518,7 +626,106 @@ impl Recv {
             stream.in_flight_recv_data = 0;
         }
 
+        // A reset may drop data released last on its way to the relaying peer, who then
+        // never grows the connection's window by it: it grows here by the data released
+        // that peer wasn't sent, once how far the body went is known (see
+        // `BodyFrames::relay_sent`), else by the data that peer's WINDOW_UPDATEs on the
+        // stream didn't cover, which holds it.
+        let relayed = stream.relayed_body.take();
+        if stream.recv_flow.is_mirror() && stream.state.is_reset() && stream.mirror_unacked != 0 {
+            let unacked = std::mem::take(&mut stream.mirror_unacked);
+            let octets = match (relay, relayed) {
+                (Some(relay), Some(relayed)) => RelayedBody::refund(
+                    &relayed,
+                    Refund {
+                        data_taken: stream.data_taken,
+                        mirrored_taken: stream.mirrored_taken,
+                        unacked,
+                        relay: relay.clone(),
+                    },
+                ),
+                _ => Some(unacked),
+            };
+            if let Some(octets) = octets {
+                self.give_back(u64::from(octets), task);
+            }
+        }
+
         self.clear_recv_buffer(stream, task, counts);
+    }
+
+    /// Grows the connection's window by `octets` of the data the client's mirrored streams
+    /// released that the relaying peer, their streams reset (see `Relay::give_back`) or their
+    /// padding not relayed, wasn't sent, less the window it announced ahead for such data
+    /// still to be kept back (see `Self::mirror_released`).
+    pub fn give_back(&mut self, octets: u64, task: &mut Option<Waker>) {
+        let octets = octets.min(u64::from(MAX_WINDOW_SIZE)) as WindowSize;
+        if octets == 0 {
+            return;
+        }
+        let announced = self.mirror_announced.min(u64::from(octets));
+        self.mirror_announced -= announced;
+        self.assign_connection_capacity(octets - announced as WindowSize, task);
+        self.mirror_covered -= u64::from(octets);
+    }
+
+    /// Takes back the window the connection gave itself for `octets` of data the client's
+    /// `stream` released before it was mirrored (see `Stream::mirror_window`), which the
+    /// relaying peer was sent and so grants: as far as not yet announced at once, the rest
+    /// from the relayed connection WINDOW_UPDATEs to come. All of it counts as released
+    /// mirrored, so that the stream, reset, gives back what of it that peer wasn't sent
+    /// after all.
+    pub fn mirror_released(&mut self, stream: &mut Stream, octets: WindowSize) {
+        let unannounced = self
+            .flow
+            .available()
+            .as_size()
+            .saturating_sub(self.flow.window_size());
+        let cancelled = unannounced.min(octets);
+        let _res = self.flow.claim_capacity(cancelled);
+        debug_assert!(_res.is_ok());
+        self.mirror_announced += u64::from(octets - cancelled);
+        self.mirror_covered += u64::from(octets);
+        stream.mirrored_taken += u64::from(octets);
+        stream.mirror_unacked = stream.mirror_unacked.saturating_add(octets);
+    }
+
+    /// The part of a relayed connection WINDOW_UPDATE's `increment` that grows the
+    /// connection's window, the relaying peer having been sent `peer_sent` octets of data
+    /// (see `Relay::set_peer_sent`): the rest repays its grants for the data the client's
+    /// mirrored streams didn't send it, whose window the connection gave itself as the
+    /// client sent theirs, or never shrank, and then the window it announced for data they
+    /// released before they were mirrored (see `Self::mirror_released`).
+    pub fn relayed_connection_increment(
+        &mut self,
+        increment: WindowSize,
+        peer_sent: u64,
+    ) -> WindowSize {
+        let owed = peer_sent.saturating_sub(self.mirror_covered + self.relay_repaid);
+        // Credit the connection gave itself but didn't announce yet is taken back instead,
+        // so the relayed WINDOW_UPDATE grants it now.
+        let unannounced = self
+            .flow
+            .available()
+            .as_size()
+            .saturating_sub(self.flow.window_size());
+        let cancelled = owed.min(u64::from(unannounced)) as WindowSize;
+        if cancelled > 0 {
+            let _res = self.flow.claim_capacity(cancelled);
+            debug_assert!(_res.is_ok());
+        }
+        let repaid = (owed - u64::from(cancelled)).min(u64::from(increment)) as WindowSize;
+        self.relay_repaid += u64::from(cancelled + repaid);
+        let increment = increment - repaid;
+        let announced = self.mirror_announced.min(u64::from(increment)) as WindowSize;
+        self.mirror_announced -= u64::from(announced);
+        increment - announced
+    }
+
+    /// Grows the connection's receive window by `increment`, which a WINDOW_UPDATE of our
+    /// own announces, leaving the unclaimed capacity as is.
+    pub fn inc_connection_window(&mut self, increment: WindowSize) -> Result<(), Reason> {
+        self.flow.inc_recv_window(increment)
     }
 
     /// Set the "target" connection window size.
@@ -531,6 +738,13 @@ impl Recv {
     /// WINDOW_UPDATEs so the peer knows it has about `target` window to use
     /// for the whole connection.
     ///
+    /// Grows the connection window by `incr`, as a connection-level WINDOW_UPDATE of
+    /// `incr` already written does.
+    pub fn grow_connection_window(&mut self, incr: WindowSize) -> Result<(), Reason> {
+        self.flow.assign_capacity(incr)?;
+        self.flow.inc_window(incr)
+    }
+
     /// The `task` is an optional parked task for the `Connection` that might
     /// be blocked on needing more window capacity.
     pub fn set_target_connection_window(
@@ -572,13 +786,21 @@ impl Recv {
         Ok(())
     }
 
+    /// Accepts `:protocol` from now on: the client may use it once it has a SETTINGS
+    /// frame enabling it, before acknowledging that (RFC 8441 §3).
+    pub(crate) fn enable_connect_protocol(&mut self) {
+        self.is_extended_connect_protocol_enabled = true;
+    }
+
     pub(crate) fn apply_local_settings(
         &mut self,
         settings: &frame::Settings,
         store: &mut Store,
     ) -> Result<(), proto::Error> {
-        if let Some(val) = settings.is_extended_connect_protocol_enabled() {
-            self.is_extended_connect_protocol_enabled = val;
+        // It can't be withdrawn once sent (RFC 8441 §3): the acknowledgement of a SETTINGS
+        // frame sent before one enabling it, arriving after that one went out, keeps it.
+        if settings.is_extended_connect_protocol_enabled() == Some(true) {
+            self.enable_connect_protocol();
         }
 
         if let Some(target) = settings.initial_window_size() {
@@ -760,6 +982,19 @@ impl Recv {
             let _res = self.release_capacity(padding, stream, &mut None);
             // cannot fail, we JUST added more in_flight data above.
             debug_assert!(_res.is_ok());
+            // Padding the relaying peer isn't sent grows the windows here, that of a frame
+            // its body's frames didn't keep among it.
+            let unrecorded = frame.is_padding_unrecorded();
+            if !stream.recv_flow.is_mirror() {
+                if unrecorded {
+                    stream.unmirrored = stream.unmirrored.saturating_sub(padding);
+                    stream.data_taken = stream.data_taken.saturating_sub(u64::from(padding));
+                } else {
+                    stream.unmirrored_padding = stream.unmirrored_padding.saturating_add(padding);
+                }
+            } else if !stream.relays_padding || unrecorded {
+                self.release_mirrored_padding(padding, stream, &mut None);
+            }
         }
 
         // An empty DATA frame without END_STREAM has no effect on the HTTP
@@ -1133,6 +1368,10 @@ impl Recv {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
+        if self.windows_held {
+            return Ok(BufferStatus::Complete);
+        }
+
         // Send any pending connection level window updates
         if self.send_connection_window_update(dst)? == BufferStatus::CodecFull {
             return Ok(BufferStatus::CodecFull);
@@ -1268,9 +1507,9 @@ impl Recv {
         &mut self,
         cx: &Context,
         stream: &mut Stream,
-    ) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
+    ) -> Poll<Option<Result<(HeaderMap, HeaderOrder), proto::Error>>> {
         match stream.pending_recv.pop_front(&mut self.buffer) {
-            Some(Event::Trailers(trailers)) => Poll::Ready(Some(Ok(trailers))),
+            Some(Event::Trailers(trailers, order)) => Poll::Ready(Some(Ok((trailers, order)))),
             Some(event) => {
                 // Frame is not trailers.. not ready to poll trailers yet.
                 stream.pending_recv.push_front(&mut self.buffer, event);

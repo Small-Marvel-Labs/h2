@@ -2,7 +2,9 @@ use super::recv::RecvHeaderBlockError;
 use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::Protocol;
+use crate::ext::{
+    BodyLayout, DataFrame, HeaderBlockEncoding, HeaderOrder, Protocol, Relay, SendBodyLayout,
+};
 use crate::frame::{self, Frame, Reason};
 use crate::proto::{peer, Error, Initiator, Open, Peer, WindowSize};
 use crate::{client, proto, server};
@@ -12,6 +14,7 @@ use http::{HeaderMap, Request, Response};
 use std::task::{Context, Poll, Waker};
 use tokio::io::AsyncWrite;
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
@@ -78,6 +81,11 @@ struct Inner {
 
     /// The number of stream refs to this shared state.
     refs: usize,
+
+    /// Relays another connection's peer's frames to this connection's peer, whose
+    /// streams' windows it may make grow only by relayed WINDOW_UPDATEs (see
+    /// `Relay::mirror_stream_window`).
+    relay: Option<Relay>,
 }
 
 #[derive(Debug)]
@@ -115,6 +123,128 @@ where
             inner: Inner::new(peer, config),
             send_buffer: Arc::new(SendBuffer::new()),
             _p: ::std::marker::PhantomData,
+        }
+    }
+
+    /// Relays another connection's peer's frames through `relay`, which may make the
+    /// remote's streams' windows grow only by relayed WINDOW_UPDATEs, after a deferred
+    /// preface, which the WINDOW_UPDATEs due wait for (see `Self::apply_preface`).
+    pub fn set_relay(&mut self, relay: Relay) {
+        let mut me = self.inner.lock().unwrap();
+        me.relay = Some(relay);
+        me.actions.recv.windows_held = true;
+        me.actions.send.flush_user_resets();
+    }
+
+    /// Applies a deferred preface's SETTINGS (`frame`) and connection WINDOW_UPDATE
+    /// (`window`, its increment) written ahead of every other frame: the remote may open
+    /// as many streams as it says, and the extended CONNECT it enables, the connection
+    /// window grew by the increment, and the WINDOW_UPDATEs due go out after it.
+    pub fn apply_preface(
+        &mut self,
+        frame: &frame::Settings,
+        window: Option<WindowSize>,
+    ) -> Result<(), Reason> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions.recv.windows_held = false;
+        if let Some(max) = frame.max_concurrent_streams() {
+            me.counts.set_max_recv_streams(max as usize);
+        }
+        if frame.is_extended_connect_protocol_enabled() == Some(true) {
+            me.actions.recv.enable_connect_protocol();
+        }
+        match window {
+            Some(incr) => me.actions.recv.grow_connection_window(incr),
+            None => Ok(()),
+        }
+    }
+
+    /// Grows the connection's receive window (`id` 0), or the client's stream `id`'s, by
+    /// `increment`, which a relayed WINDOW_UPDATE announces (see
+    /// [`RelayedFrame::WindowUpdate`](crate::ext::RelayedFrame::WindowUpdate)): the
+    /// stream's then grows only by those, the connection's by what's left once they repaid
+    /// what it gave itself (see `Recv::relayed_connection_increment`). The increment it
+    /// grew by, so that a WINDOW_UPDATE of it goes out.
+    pub fn relay_window_update(
+        &mut self,
+        id: StreamId,
+        increment: WindowSize,
+    ) -> Option<WindowSize> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        if id.is_zero() {
+            let peer_sent = me.relay.as_ref().map_or(0, Relay::peer_sent);
+            let increment = me
+                .actions
+                .recv
+                .relayed_connection_increment(increment, peer_sent);
+            return (increment != 0 && me.actions.recv.inc_connection_window(increment).is_ok())
+                .then_some(increment);
+        }
+        match me.store.find_mut(&id) {
+            Some(mut stream) if !stream.state.is_closed() => {
+                let relays_padding = stream.relays_padding;
+                let sent = stream.mirror_window(relays_padding);
+                me.actions.recv.mirror_released(&mut stream, sent);
+                let repaid = increment.min(stream.unmirrored);
+                stream.unmirrored -= repaid;
+                let increment = increment - repaid;
+                stream.mirror_unacked = stream.mirror_unacked.saturating_sub(increment);
+                stream
+                    .recv_flow
+                    .inc_recv_window(increment)
+                    .is_ok()
+                    .then_some(increment)
+            }
+            _ => None,
+        }
+    }
+
+    /// Grows the connection's receive window by `octets` of the data the client's reset
+    /// streams released that the relaying peer wasn't sent (see `Relay::give_back`).
+    pub fn give_back(&mut self, octets: u64) {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions.recv.give_back(octets, &mut me.actions.task);
+    }
+
+    /// Makes stream `id`'s window grow only by relayed WINDOW_UPDATEs (see
+    /// `Relay::mirror_stream_window`).
+    pub fn mirror_stream_window(&mut self, id: StreamId, relays_padding: bool) {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        if let Some(mut stream) = me.store.find_mut(&id) {
+            let sent = stream.mirror_window(relays_padding);
+            me.actions.recv.mirror_released(&mut stream, sent);
+        }
+    }
+
+    pub fn set_max_recv_streams(&mut self, max: usize) {
+        self.inner.lock().unwrap().counts.set_max_recv_streams(max);
+    }
+
+    pub fn enable_connect_protocol(&mut self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .actions
+            .recv
+            .enable_connect_protocol();
+    }
+
+    /// Grows the receive window of the client's mirrored stream `id`, and the connection's,
+    /// by `octets` of the padding it received that the relaying peer wasn't sent (see
+    /// `Relay::release_padding`).
+    pub fn release_padding(&mut self, id: StreamId, octets: WindowSize) {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        if let Some(mut stream) = me.store.find_mut(&id) {
+            if stream.recv_flow.is_mirror() {
+                me.actions
+                    .recv
+                    .release_mirrored_padding(octets, &mut stream, &mut me.actions.task);
+            }
         }
     }
 
@@ -173,6 +303,13 @@ where
                 BufferStatus::CodecFull => ready!(dst.poll_ready(cx))?,
             }
         }
+    }
+
+    /// Ready once the data received and not yet released leaves room for more: the
+    /// connection reads no more frames meanwhile.
+    pub fn poll_buffered_room(&mut self, cx: &Context) -> Poll<()> {
+        let mut me = self.inner.lock().unwrap();
+        me.actions.recv.poll_buffered_room(cx)
     }
 
     pub fn clear_expired_reset_streams(&mut self) {
@@ -269,6 +406,7 @@ where
         use http::Method;
 
         let protocol = request.extensions_mut().remove::<Protocol>();
+        let order = request.extensions_mut().remove::<HeaderOrder>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -318,7 +456,7 @@ where
 
         // Convert the message
         let headers =
-            client::Peer::convert_send_message(stream_id, request, protocol, end_of_stream)?;
+            client::Peer::convert_send_message(stream_id, request, protocol, order, end_of_stream)?;
 
         let mut stream = me.store.insert(stream.id, stream);
 
@@ -387,8 +525,25 @@ impl<B> DynStreams<'_, B> {
 
     pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
+        let id = frame.stream_id();
+        // The log of a request opening a stream, told should it not be handed over.
+        let opening = frame
+            .received()
+            .map(|received| received.connection.clone())
+            .filter(|_| self.peer.is_server() && me.store.find_mut(&id).is_none());
 
-        me.recv_headers(self.peer, self.send_buffer, frame)
+        let result = me.recv_headers(self.peer, self.send_buffer, frame);
+        if let Some(log) = opening {
+            let handed = me
+                .store
+                .find_mut(&id)
+                .map_or(false, |stream| stream.is_pending_accept);
+            drop(me);
+            if !handed {
+                log.unhandled(id.into());
+            }
+        }
+        result
     }
 
     pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), Error> {
@@ -445,6 +600,49 @@ impl<B> DynStreams<'_, B> {
         let mut me = self.inner.lock().unwrap();
         me.actions.recv.go_away(last_processed_id);
     }
+
+    /// Refuses each open stream the peer opened past `last_processed_id`, which a GOAWAY
+    /// naming it tells the peer went unprocessed, closing it with no RST_STREAM, and each
+    /// one of `unprocessed` (sorted) at or below it with RST_STREAM(REFUSED_STREAM).
+    pub fn refuse(&mut self, last_processed_id: StreamId, unprocessed: &[u32]) {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        let peer = me.counts.peer();
+        let mut refused = Vec::new();
+        me.store.for_each(|stream| {
+            if (stream.id > last_processed_id
+                || unprocessed.binary_search(&u32::from(stream.id)).is_ok())
+                && !peer.is_local_init(stream.id)
+                && !stream.state.is_closed()
+            {
+                refused.push(stream.id);
+            }
+        });
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+        for id in refused {
+            let Some(stream) = me.store.find_mut(&id) else {
+                continue;
+            };
+            if id > last_processed_id {
+                let actions = &mut me.actions;
+                let err = Error::Reset(id, Reason::REFUSED_STREAM, Initiator::Library);
+                me.counts.transition(stream, |counts, stream| {
+                    actions.recv.handle_error(&err, stream);
+                    actions.send.handle_error(send_buffer, stream, counts);
+                });
+            } else {
+                let _res = me.actions.send_reset(
+                    stream,
+                    Reason::REFUSED_STREAM,
+                    Initiator::User,
+                    &mut me.counts,
+                    send_buffer,
+                );
+                debug_assert!(_res.is_ok());
+            }
+        }
+    }
 }
 
 impl Inner {
@@ -459,7 +657,20 @@ impl Inner {
             },
             store: Store::new(),
             refs: 1,
+            relay: None,
         }))
+    }
+
+    /// Makes `stream`'s window grow only by relayed WINDOW_UPDATEs, if asked to since
+    /// last checked (see `Relay::mirror_stream_window`).
+    fn mirror_if_asked(relay: &Option<Relay>, recv: &mut Recv, stream: &mut Stream) {
+        if let Some(relays_padding) = relay
+            .as_ref()
+            .and_then(|relay| relay.take_mirrored(stream.id.into()))
+        {
+            let sent = stream.mirror_window(relays_padding);
+            recv.mirror_released(stream, sent);
+        }
     }
 
     fn recv_headers<B>(
@@ -632,6 +843,8 @@ impl Inner {
             }
         };
 
+        let mut stream = stream;
+        Inner::mirror_if_asked(&self.relay, &mut self.actions.recv, &mut stream);
         let actions = &mut self.actions;
         let mut send_buffer = send_buffer.inner.lock().unwrap();
         let send_buffer = &mut *send_buffer;
@@ -1175,6 +1388,86 @@ where
 
 // ===== impl StreamRef =====
 
+/// The frames a body's chunk of `len` bytes goes as, after `index` chunks carrying data,
+/// as the DATA frames `layout` tells, held in `pending` until their chunk comes (see
+/// [`SendBodyLayout`]); empty for one frame carrying it unpadded.
+fn plan_data(
+    layout: &dyn BodyLayout,
+    pending: &mut VecDeque<DataFrame>,
+    index: u64,
+    len: usize,
+    end_stream: bool,
+) -> VecDeque<frame::PlannedFrame> {
+    let planned = |data, received: DataFrame| frame::PlannedFrame {
+        data,
+        padding: received.padding,
+    };
+    let empty = |received: &&DataFrame| {
+        received.index == index && received.len == 0 && !received.end_stream
+    };
+    // Those carrying padding or nothing go on as empty frames of their own when the body's
+    // chunks didn't match them, so that the peer's flow control still takes what the other
+    // connection's did (see `BodyLayout::misplaced`).
+    let moves = |received: &DataFrame| {
+        received.padding.is_some() || (received.len == 0 && !received.end_stream)
+    };
+    pending.extend(layout.take((!end_stream).then_some(index)));
+    let mut misplaced = false;
+    let mut plan = VecDeque::new();
+    pending.retain(|received| {
+        let kept = received.index >= index;
+        if !kept {
+            misplaced = true;
+            if moves(received) {
+                plan.push_back(planned(false, *received));
+            }
+        }
+        kept
+    });
+    if len == 0 && !end_stream {
+        // A chunk carrying nothing goes as the empty frame it stands for.
+        if let Some(received) = pending.front().filter(empty).copied() {
+            pending.pop_front();
+            plan.push_back(planned(true, received));
+        } else if !plan.is_empty() {
+            plan.push_back(frame::PlannedFrame {
+                data: true,
+                padding: None,
+            });
+        }
+    } else {
+        while let Some(received) = pending.front().filter(empty).copied() {
+            pending.pop_front();
+            plan.push_back(planned(false, received));
+        }
+        let carrying = pending.front().copied().filter(|received| {
+            received.index == index && received.len == len && (len > 0 || received.end_stream)
+        });
+        if carrying.is_some() {
+            pending.pop_front();
+        }
+        plan.push_back(frame::PlannedFrame {
+            data: true,
+            padding: carrying.and_then(|received| received.padding),
+        });
+        if end_stream {
+            for received in pending.drain(..) {
+                misplaced |= len == 0 || received.len > 0;
+                if moves(&received) || (len > 0 && received.len == 0) {
+                    plan.push_back(planned(false, received));
+                }
+            }
+        }
+    }
+    if misplaced {
+        layout.misplaced();
+    }
+    if plan.iter().all(|frame| frame.padding.is_none()) && plan.len() <= 1 {
+        plan.clear();
+    }
+    plan
+}
+
 impl<B> StreamRef<B> {
     pub fn send_data(&mut self, data: B, end_stream: bool) -> Result<(), UserError>
     where
@@ -1192,6 +1485,15 @@ impl<B> StreamRef<B> {
             // Create the data frame
             let mut frame = frame::Data::new(stream.id, data);
             frame.set_end_stream(end_stream);
+            if let Some(layout) = stream.body_layout.clone() {
+                let len = frame.payload().remaining();
+                let index = stream.body_chunks;
+                *frame.plan_mut() =
+                    plan_data(&*layout, &mut stream.body_frames, index, len, end_stream);
+                if len > 0 {
+                    stream.body_chunks += 1;
+                }
+            }
 
             // Send the data frame
             actions
@@ -1200,7 +1502,11 @@ impl<B> StreamRef<B> {
         })
     }
 
-    pub fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), UserError> {
+    pub fn send_trailers(
+        &mut self,
+        trailers: HeaderMap,
+        order: HeaderOrder,
+    ) -> Result<(), UserError> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
@@ -1211,7 +1517,15 @@ impl<B> StreamRef<B> {
 
         me.counts.transition(stream, |counts, stream| {
             // Create the trailers frame
-            let frame = frame::Headers::trailers(stream.id, trailers);
+            let mut frame = frame::Headers::trailers(stream.id, trailers);
+            frame.set_header_order(order);
+            if let Some(encoding) = stream
+                .body_layout
+                .as_ref()
+                .and_then(|layout| layout.take_trailers())
+            {
+                frame.set_encoding(encoding);
+            }
 
             // Send the trailers frame
             actions
@@ -1286,6 +1600,9 @@ impl<B> StreamRef<B> {
         mut response: Response<()>,
         end_of_stream: bool,
     ) -> Result<(), UserError> {
+        let order = response.extensions_mut().remove::<HeaderOrder>();
+        let encoding = response.extensions_mut().remove::<HeaderBlockEncoding>();
+        let body_layout = response.extensions_mut().remove::<SendBodyLayout>();
         // Clear before taking lock, incase extensions contain a StreamRef.
         response.extensions_mut().clear();
         let mut me = self.opaque.inner.lock().unwrap();
@@ -1297,7 +1614,12 @@ impl<B> StreamRef<B> {
         let send_buffer = &mut *send_buffer;
 
         me.counts.transition(stream, |counts, stream| {
-            let frame = server::Peer::convert_send_message(stream.id, response, end_of_stream);
+            let mut frame =
+                server::Peer::convert_send_message(stream.id, response, order, end_of_stream);
+            if let Some(encoding) = encoding {
+                frame.set_encoding(encoding);
+            }
+            stream.body_layout = body_layout.map(|layout| layout.0);
 
             actions
                 .send
@@ -1309,6 +1631,8 @@ impl<B> StreamRef<B> {
         &mut self,
         mut request: Request<()>,
     ) -> Result<StreamRef<B>, UserError> {
+        let order = request.extensions_mut().remove::<HeaderOrder>();
+        let encoding = request.extensions_mut().remove::<HeaderBlockEncoding>();
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
         let mut me = self.opaque.inner.lock().unwrap();
@@ -1337,7 +1661,14 @@ impl<B> StreamRef<B> {
         let pushed = {
             let mut stream = me.store.resolve(self.opaque.key);
 
-            let frame = crate::server::Peer::convert_push_message(stream.id, promised_id, request)?;
+            let mut frame =
+                crate::server::Peer::convert_push_message(stream.id, promised_id, request)?;
+            if let Some(order) = order {
+                frame.set_header_order(order);
+            }
+            if let Some(encoding) = encoding {
+                frame.set_encoding(encoding);
+            }
 
             actions
                 .send
@@ -1426,6 +1757,36 @@ impl<B> StreamRef<B> {
         let mut stream = me.store.resolve(self.opaque.key);
 
         me.actions.send.poll_reset(cx, &mut stream, mode)
+    }
+
+    /// Ready once fewer than [`proto::MAX_QUEUED_FRAMES`] frames are queued on the stream.
+    pub fn poll_queue_room(&mut self, cx: &Context) -> Poll<()> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.opaque.key);
+        if stream.pending_send.len() < proto::MAX_QUEUED_FRAMES {
+            return Poll::Ready(());
+        }
+        stream.wait_send(cx);
+        Poll::Pending
+    }
+
+    /// Ready once the frames queued on the stream have all been handed to the connection
+    /// to write, so a frame queued afterwards on another stream goes out after them, or once
+    /// they wait for the stream to be opened, which waits on other streams closing.
+    pub fn poll_flushed(&mut self, cx: &Context) -> Poll<()> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.opaque.key);
+        if stream.pending_send.is_empty()
+            || (stream.is_pending_open && !me.counts.can_inc_num_send_streams())
+        {
+            return Poll::Ready(());
+        }
+        stream.wait_flushed(cx);
+        Poll::Pending
     }
 
     pub fn clone_to_opaque(&self) -> OpaqueStreamRef {
@@ -1528,7 +1889,10 @@ impl OpaqueStreamRef {
             })
     }
 
-    pub fn poll_trailers(&mut self, cx: &Context) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
+    pub fn poll_trailers(
+        &mut self,
+        cx: &Context,
+    ) -> Poll<Option<Result<(HeaderMap, HeaderOrder), proto::Error>>> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
@@ -1560,6 +1924,7 @@ impl OpaqueStreamRef {
         let me = &mut *me;
 
         let mut stream = me.store.resolve(self.key);
+        Inner::mirror_if_asked(&me.relay, &mut me.actions.recv, &mut stream);
 
         me.actions
             .recv
@@ -1651,6 +2016,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
     stream.ref_dec();
 
     let actions = &mut me.actions;
+    let relay = &me.relay;
 
     // If the stream is not referenced and it is already
     // closed (does not have to go through logic below
@@ -1670,7 +2036,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
             // it anymore.
             actions
                 .recv
-                .release_closed_capacity(stream, &mut actions.task, counts);
+                .release_closed_capacity(stream, relay.as_ref(), &mut actions.task, counts);
 
             // We won't be able to reach our push promises anymore
             let mut ppp = stream.pending_push_promises.take();

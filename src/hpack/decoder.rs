@@ -1,4 +1,5 @@
 use super::{header::BytesStr, huffman, Header};
+use crate::ext::{FieldRepresentation, LiteralIndexing};
 use crate::frame;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -20,6 +21,13 @@ pub struct Decoder {
     last_max_update: usize,
     table: Table,
     buffer: BytesMut,
+    /// The dynamic table size updates decoded since [`Decoder::take_size_updates`] (see
+    /// [`push_size_update`]), and the octets they took.
+    size_updates: Vec<usize>,
+    size_update_octets: usize,
+    /// Whether the header block being decoded had a field, past which it may have no
+    /// dynamic table size update (RFC 7541 §4.2).
+    block_has_field: bool,
 }
 
 /// Represents all errors that can be encountered while performing the decoding
@@ -147,6 +155,7 @@ struct StringMarker {
     offset: usize,
     len: usize,
     string: Option<Bytes>,
+    huffman: bool,
 }
 
 // ===== impl Decoder =====
@@ -159,7 +168,19 @@ impl Decoder {
             last_max_update: size,
             table: Table::new(size),
             buffer: BytesMut::with_capacity(4096),
+            size_updates: Vec::new(),
+            size_update_octets: 0,
+            block_has_field: false,
         }
+    }
+
+    /// The dynamic table size updates decoded since the last call, as
+    /// [`push_size_update`] keeps them, and the octets they took.
+    pub fn take_size_updates(&mut self) -> (Vec<usize>, usize) {
+        (
+            std::mem::take(&mut self.size_updates),
+            std::mem::take(&mut self.size_update_octets),
+        )
     }
 
     /// Queues a potential size update
@@ -173,18 +194,33 @@ impl Decoder {
         self.max_size_update = Some(size);
     }
 
-    /// Decodes the headers found in the given buffer.
-    pub fn decode<F>(
+    /// Decodes the headers found in the given buffer, a whole header block.
+    #[cfg(any(test, fuzzing))]
+    pub fn decode<F>(&mut self, src: &mut Cursor<&mut BytesMut>, f: F) -> Result<(), DecoderError>
+    where
+        F: FnMut(Header, FieldRepresentation) -> ControlFlow<()>,
+    {
+        self.decode_fragment(src, true, f)
+    }
+
+    /// Decodes the headers found in a header block's next fragment, its first when
+    /// `first`, telling of each how it went: a pseudo-header can't say it came as a
+    /// never-indexed literal itself, as a field's sensitive value does. Dynamic table
+    /// size updates may only open the block, whichever fragments carry them.
+    pub fn decode_fragment<F>(
         &mut self,
         src: &mut Cursor<&mut BytesMut>,
+        first: bool,
         mut f: F,
     ) -> Result<(), DecoderError>
     where
-        F: FnMut(Header) -> ControlFlow<()>,
+        F: FnMut(Header, FieldRepresentation) -> ControlFlow<()>,
     {
         use self::Representation::*;
 
-        let mut can_resize = true;
+        if first {
+            self.block_has_field = false;
+        }
 
         if let Some(size) = self.max_size_update.take() {
             self.last_max_update = size;
@@ -202,50 +238,56 @@ impl Decoder {
             match Representation::load(ty)? {
                 Indexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"Indexed");
-                    can_resize = false;
-                    let entry = self.decode_indexed(src)?;
+                    self.block_has_field = true;
+                    let (index, entry) = self.decode_indexed(src)?;
                     consume(src);
-                    if f(entry).is_break() {
+                    if f(entry, FieldRepresentation::Indexed(index)).is_break() {
                         break;
                     }
                 }
                 LiteralWithIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");
-                    can_resize = false;
-                    let entry = self.decode_literal(src, true)?;
+                    self.block_has_field = true;
+                    let (entry, representation) =
+                        self.decode_literal(src, LiteralIndexing::Incremental)?;
 
                     // Insert the header into the table
                     self.table.insert(entry.clone());
                     consume(src);
 
-                    if f(entry).is_break() {
+                    if f(entry, representation).is_break() {
                         break;
                     }
                 }
                 LiteralWithoutIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
-                    can_resize = false;
-                    let entry = self.decode_literal(src, false)?;
+                    self.block_has_field = true;
+                    let (entry, representation) =
+                        self.decode_literal(src, LiteralIndexing::Without)?;
                     consume(src);
-                    if f(entry).is_break() {
+                    if f(entry, representation).is_break() {
                         break;
                     }
                 }
                 LiteralNeverIndexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
-                    can_resize = false;
-                    let entry = self.decode_literal(src, false)?;
+                    self.block_has_field = true;
+                    let (mut entry, representation) =
+                        self.decode_literal(src, LiteralIndexing::Never)?;
                     consume(src);
 
-                    // TODO: Track that this should never be indexed
+                    // An intermediary encodes it never indexed too (RFC 7541 §6.2.3).
+                    if let Header::Field { ref mut value, .. } = entry {
+                        value.set_sensitive(true);
+                    }
 
-                    if f(entry).is_break() {
+                    if f(entry, representation).is_break() {
                         break;
                     }
                 }
                 SizeUpdate => {
                     tracing::trace!(rem = src.remaining(), kind = %"SizeUpdate");
-                    if !can_resize {
+                    if self.block_has_field {
                         return Err(DecoderError::InvalidMaxDynamicSize);
                     }
 
@@ -260,6 +302,7 @@ impl Decoder {
     }
 
     fn process_size_update(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<(), DecoderError> {
+        let start = buf.position();
         let new_size = decode_int(buf, 5)?;
 
         if new_size > self.last_max_update {
@@ -273,21 +316,30 @@ impl Decoder {
         );
 
         self.table.set_max_size(new_size);
+        push_size_update(&mut self.size_updates, new_size);
+        self.size_update_octets += (buf.position() - start) as usize;
 
         Ok(())
     }
 
-    fn decode_indexed(&self, buf: &mut Cursor<&mut BytesMut>) -> Result<Header, DecoderError> {
+    fn decode_indexed(
+        &self,
+        buf: &mut Cursor<&mut BytesMut>,
+    ) -> Result<(usize, Header), DecoderError> {
         let index = decode_int(buf, 7)?;
-        self.table.get(index)
+        Ok((index, self.table.get(index)?))
     }
 
     fn decode_literal(
         &mut self,
         buf: &mut Cursor<&mut BytesMut>,
-        index: bool,
-    ) -> Result<Header, DecoderError> {
-        let prefix = if index { 6 } else { 4 };
+        indexing: LiteralIndexing,
+    ) -> Result<(Header, FieldRepresentation), DecoderError> {
+        let prefix = if indexing == LiteralIndexing::Incremental {
+            6
+        } else {
+            4
+        };
 
         // Extract the table index for the name, or 0 if not indexed
         let table_idx = decode_int(buf, prefix)?;
@@ -298,15 +350,30 @@ impl Decoder {
             let name_marker = self.try_decode_string(buf)?;
             let value_marker = self.try_decode_string(buf)?;
             buf.set_position(old_pos);
+            let representation = FieldRepresentation::Literal {
+                indexing,
+                name_index: None,
+                name_huffman: name_marker.huffman,
+                value_huffman: value_marker.huffman,
+            };
             // Read the name as a literal
             let name = name_marker.consume(buf);
             let value = value_marker.consume(buf);
-            Header::new(name, value)
+            Ok((Header::new(name, value)?, representation))
         } else {
             let e = self.table.get(table_idx)?;
-            let value = self.decode_string(buf)?;
+            let old_pos = buf.position();
+            let marker = self.try_decode_string(buf)?;
+            buf.set_position(old_pos);
+            let representation = FieldRepresentation::Literal {
+                indexing,
+                name_index: Some(table_idx),
+                name_huffman: false,
+                value_huffman: marker.huffman,
+            };
+            let value = marker.consume(buf);
 
-            e.name().into_entry(value)
+            Ok((e.name().into_entry(value)?, representation))
         }
     }
 
@@ -339,6 +406,7 @@ impl Decoder {
                     offset,
                     len,
                     string: Some(BytesMut::freeze(buf)),
+                    huffman: true,
                 })
             };
 
@@ -350,10 +418,12 @@ impl Decoder {
                 offset,
                 len,
                 string: None,
+                huffman: false,
             })
         }
     }
 
+    #[cfg(test)]
     fn decode_string(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<Bytes, DecoderError> {
         let old_pos = buf.position();
         let marker = self.try_decode_string(buf)?;
@@ -454,6 +524,20 @@ fn decode_int<B: Buf>(buf: &mut B, prefix_size: u8) -> Result<usize, DecoderErro
     }
 
     Err(DecoderError::NeedMore(NeedMore::IntegerUnderflow))
+}
+
+/// Records `size`, a dynamic table size update following `updates`, keeping as many as
+/// RFC 7541 §4.2 lets a block carry: the smallest of them, then the last, which leave
+/// the table as the whole run does.
+pub(crate) fn push_size_update(updates: &mut Vec<usize>, size: usize) {
+    if let [first, second] = updates[..] {
+        let smallest = first.min(second);
+        updates.clear();
+        if smallest < size {
+            updates.push(smallest);
+        }
+    }
+    updates.push(size);
 }
 
 fn peek_u8<B: Buf>(buf: &B) -> Option<u8> {
@@ -860,7 +944,7 @@ mod test {
     fn test_decode_empty() {
         let mut de = Decoder::new(0);
         let mut buf = BytesMut::new();
-        de.decode(&mut Cursor::new(&mut buf), |_| ControlFlow::Continue(()))
+        de.decode(&mut Cursor::new(&mut buf), |_, _| ControlFlow::Continue(()))
             .unwrap();
     }
 
@@ -875,7 +959,7 @@ mod test {
         buf.extend(huff_encode(b"bar"));
 
         let mut res = vec![];
-        de.decode(&mut Cursor::new(&mut buf), |h| {
+        de.decode(&mut Cursor::new(&mut buf), |h, _| {
             res.push(h);
             ControlFlow::Continue(())
         })
@@ -916,7 +1000,7 @@ mod test {
 
         let mut res = vec![];
         let e = de
-            .decode(&mut Cursor::new(&mut buf), |h| {
+            .decode(&mut Cursor::new(&mut buf), |h, _| {
                 res.push(h);
                 ControlFlow::Continue(())
             })
@@ -926,7 +1010,7 @@ mod test {
 
         // extend buf with the remaining header value
         buf.extend(&value[1..]);
-        de.decode(&mut Cursor::new(&mut buf), |h| {
+        de.decode(&mut Cursor::new(&mut buf), |h, _| {
             res.push(h);
             ControlFlow::Continue(())
         })

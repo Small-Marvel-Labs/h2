@@ -2,17 +2,24 @@ use crate::codec::UserError;
 use crate::frame::{Reason, StreamId};
 use crate::{client, server};
 
+use crate::ext::{DeferredPreface, PrefaceFrame, Relay, RelayedAck, RelayedEnd, RelayedFrame};
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
+use crate::proto::ping_pong::ReceivedPing;
 use crate::proto::*;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use futures_core::Stream;
+use std::collections::VecDeque;
 use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::AsyncRead;
+
+/// How many relayed SETTINGS frames, or PINGs, may await the client's ACKs at once: those
+/// past them wait, so that the relaying caller waits too (see `Relay::poll_ready`).
+const MAX_RELAYED_WAITING: usize = 1024;
 
 /// An H2 connection
 #[derive(Debug)]
@@ -22,6 +29,29 @@ where
 {
     /// Read / write frame values
     codec: Codec<T, Prioritized<B>>,
+
+    /// The preface still to send, while writes wait for it (see
+    /// `server::Builder::deferred_preface`).
+    deferred_preface: Option<DeferredPreface>,
+
+    /// Whether the peer's GOAWAY leaves closing to the peer (see
+    /// `server::Builder::leave_close_to_client`).
+    leave_close_to_client: bool,
+
+    /// The end of another connection it ends as (see `server::Builder::relayed_end`),
+    /// whether it closed, and the number of the relayed GOAWAY waiting to be written.
+    relayed_end: Option<RelayedEnd>,
+    relayed_close: bool,
+    relayed_unsent: Option<u64>,
+
+    /// The frames relayed to the peer after the deferred preface (see `Relay`), and those
+    /// taken from it still to send.
+    relay: Option<Relay>,
+    relayed: VecDeque<RelayedFrame>,
+
+    /// The most streams the peer may open at once that the connection was built to accept,
+    /// past which relayed SETTINGS, and the deferred preface's, can't raise it.
+    max_concurrent_streams: Option<u32>,
 
     inner: ConnectionInner<P, B>,
 }
@@ -84,6 +114,9 @@ pub(crate) struct Config {
     pub local_error_reset_streams_max: Option<usize>,
     pub settings: frame::Settings,
     pub data_frame_budget: usize,
+    pub deferred_preface: Option<DeferredPreface>,
+    pub leave_close_to_client: bool,
+    pub relayed_end: Option<RelayedEnd>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -124,7 +157,7 @@ where
     P: Peer,
     B: Buf,
 {
-    pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
+    pub fn new(mut codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
         fn streams_config(config: &Config) -> streams::Config {
             streams::Config {
                 initial_max_send_streams: config.initial_max_send_streams,
@@ -147,11 +180,25 @@ where
                 data_frame_budget: config.data_frame_budget,
             }
         }
-        let streams = Streams::new(streams_config(&config));
+        let mut streams = Streams::new(streams_config(&config));
+        if let Some(preface) = &config.deferred_preface {
+            streams.set_relay(preface.relay());
+        }
+        if let Some(end) = &config.relayed_end {
+            codec.count_written(end.written_counter());
+        }
         let span = tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         span.follows_from(tracing::Span::current());
         Connection {
             codec,
+            relay: config.deferred_preface.as_ref().map(DeferredPreface::relay),
+            relayed: VecDeque::new(),
+            max_concurrent_streams: config.settings.max_concurrent_streams(),
+            deferred_preface: config.deferred_preface,
+            leave_close_to_client: config.leave_close_to_client,
+            relayed_end: config.relayed_end,
+            relayed_close: false,
+            relayed_unsent: None,
             inner: ConnectionInner {
                 state: State::Open,
                 error: None,
@@ -223,12 +270,189 @@ where
         Poll::Ready(Ok(()))
     }
 
+    /// Applies the relay's asks to mirror the client's streams' windows and to grow them by
+    /// padding (see `Relay::mirror_stream_window`, `Relay::release_padding`), and the
+    /// connection's by the data reset streams gave back (see `Relay::give_back`), ahead of
+    /// the WINDOW_UPDATEs due, so that none goes out for what the relaying peer grants.
+    fn apply_relayed_windows(&mut self) {
+        let Some(relay) = &self.relay else {
+            return;
+        };
+        for (stream_id, relays_padding) in relay.take_all_mirrored() {
+            self.inner
+                .streams
+                .mirror_stream_window(stream_id.into(), relays_padding);
+        }
+        for (stream_id, octets) in relay.take_released_padding() {
+            self.inner.streams.release_padding(stream_id.into(), octets);
+        }
+        let given_back = relay.take_given_back();
+        if given_back != 0 {
+            self.inner.streams.give_back(given_back);
+        }
+    }
+
+    /// Sends the frames relayed so far (see `Relay`), in order, once the deferred preface
+    /// went out, and the acknowledgements due of the client's SETTINGS and PINGs no longer
+    /// awaiting relayed ones; pending, so that the connection reads no more of the client's
+    /// frames, while as many of its PINGs as may await relayed ACKs do, unless it owes
+    /// ACKs of the frames relayed, which it would otherwise never send.
+    fn poll_relay(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        let Some(relay) = &self.relay else {
+            return Poll::Ready(Ok(()));
+        };
+        let relays_acks = self.inner.set_forwarding(relay);
+        if self.deferred_preface.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        if !relays_acks {
+            while self.inner.settings.is_awaiting() {
+                ready!(self.codec.poll_ready(cx))?;
+                self.inner
+                    .settings
+                    .ack_awaiting(&mut self.codec, &mut self.inner.streams)?;
+            }
+            while let Some(payload) = self.inner.ping_pong.first_awaiting() {
+                ready!(self.codec.poll_ready(cx))?;
+                self.inner.ping_pong.ack_awaiting();
+                self.codec
+                    .buffer(frame::Ping::pong(payload).into())
+                    .expect("invalid ping frame");
+            }
+        }
+        // Taken once those taken before went, so that a client slow to read holds the
+        // relaying caller back (see `Relay::poll_ready`).
+        loop {
+            if self.relayed.is_empty() {
+                self.relayed = relay.poll_take(cx);
+                if self.relayed.is_empty() {
+                    break;
+                }
+            }
+            // A relayed SETTINGS frame or PING waits while as many as may await the
+            // client's ACKs do.
+            match self.relayed.front() {
+                Some(RelayedFrame::Settings(_))
+                    if self.inner.settings.relayed_waiting() >= MAX_RELAYED_WAITING =>
+                {
+                    break
+                }
+                Some(RelayedFrame::Ping(_))
+                    if self.inner.ping_pong.relayed_waiting() >= MAX_RELAYED_WAITING =>
+                {
+                    break
+                }
+                _ => {}
+            }
+            ready!(self.codec.poll_ready(cx))?;
+            match self.relayed.pop_front().expect("a frame is relayed") {
+                RelayedFrame::Settings(params) => {
+                    let mut settings = frame::Settings::default();
+                    let params = frame::sent_params(&params, self.max_concurrent_streams, false);
+                    settings.set_wire(params).map_err(|_| {
+                        Error::library_go_away_data(
+                            Reason::INTERNAL_ERROR,
+                            "invalid_relayed_settings",
+                        )
+                    })?;
+                    self.codec
+                        .buffer(settings.clone().into())
+                        .expect("invalid settings frame");
+                    // The client may open streams up to a raise before it acknowledges it.
+                    if let Some(max) = settings.max_concurrent_streams() {
+                        let max = (max as usize).max(self.inner.streams.max_recv_streams());
+                        self.inner.streams.set_max_recv_streams(max);
+                    }
+                    if settings.is_extended_connect_protocol_enabled() == Some(true) {
+                        self.inner.streams.enable_connect_protocol();
+                    }
+                    self.inner.settings.sent_relayed(settings);
+                }
+                RelayedFrame::Ping(payload) => {
+                    self.codec
+                        .buffer(frame::Ping::new(payload).into())
+                        .expect("invalid ping frame");
+                    self.inner.ping_pong.sent_relayed(payload);
+                }
+                RelayedFrame::WindowUpdate {
+                    stream_id,
+                    increment,
+                } => {
+                    let stream_id = StreamId::from(stream_id);
+                    if let Some(increment) =
+                        self.inner.streams.relay_window_update(stream_id, increment)
+                    {
+                        self.codec
+                            .buffer(frame::WindowUpdate::new(stream_id, increment).into())
+                            .expect("invalid window update frame");
+                    }
+                }
+                RelayedFrame::Priority {
+                    stream_id,
+                    priority,
+                } => {
+                    let mut frame = BytesMut::with_capacity(frame::HEADER_LEN + 5);
+                    frame.put_uint(5, 3);
+                    frame.put_u8(frame::Kind::Priority as u8);
+                    frame.put_u8(0);
+                    frame.put_u32(stream_id);
+                    frame.put_u32(priority.dependency | u32::from(priority.exclusive) << 31);
+                    frame.put_u8(priority.weight);
+                    self.codec.buffer_raw(&frame);
+                }
+                RelayedFrame::Unknown {
+                    kind,
+                    flags,
+                    stream_id,
+                    payload,
+                } => {
+                    let mut frame = BytesMut::with_capacity(frame::HEADER_LEN + payload.len());
+                    frame.put_uint(payload.len() as u64, 3);
+                    frame.put_u8(kind);
+                    frame.put_u8(flags);
+                    frame.put_u32(stream_id);
+                    frame.put(payload);
+                    self.codec.buffer_raw(&frame);
+                }
+                RelayedFrame::SettingsAck => self
+                    .inner
+                    .settings
+                    .recv_relayed_ack(&mut self.codec, &mut self.inner.streams)?,
+                RelayedFrame::PingAck(payload) => {
+                    if self.inner.ping_pong.take_awaiting(&payload) {
+                        self.codec
+                            .buffer(frame::Ping::pong(payload).into())
+                            .expect("invalid ping frame");
+                    }
+                }
+            }
+        }
+        self.inner.ping_pong.poll_expired(cx);
+        // Woken as more frames are relayed (see `Relay::poll_take`), or one of the client's
+        // PINGs no longer awaits its relayed ACK.
+        if self.relayed.is_empty()
+            && self.inner.ping_pong.is_awaiting_full()
+            && self.inner.ping_pong.relayed_waiting() == 0
+            && self.inner.settings.relayed_waiting() == 0
+        {
+            return Poll::Pending;
+        }
+        Poll::Ready(Ok(()))
+    }
+
     /// Send any pending GOAWAY frames.
     ///
     /// This will return `Some(reason)` if the connection should be closed
     /// afterwards. If this is a graceful shutdown, this returns `None`.
     fn poll_go_away(&mut self, cx: &mut Context) -> Poll<Option<io::Result<Reason>>> {
-        self.inner.go_away.send_pending_go_away(cx, &mut self.codec)
+        let polled = self.inner.go_away.send_pending_go_away(cx, &mut self.codec);
+        if !self.inner.go_away.is_sending() {
+            if let (Some(number), Some(relayed)) = (self.relayed_unsent, &self.relayed_end) {
+                relayed.sent(number);
+                self.relayed_unsent = None;
+            }
+        }
+        polled
     }
 
     pub fn go_away_from_user(&mut self, e: Reason) {
@@ -293,6 +517,17 @@ where
         let span = tracing::trace_span!("poll");
         let _e = span.enter();
 
+        if let Some(deferred) = &mut self.deferred_preface {
+            if let Poll::Ready(frames) = deferred.poll_frames(cx) {
+                self.deferred_preface = None;
+                self.send_preface(frames)?;
+            }
+        }
+
+        if let Some(relayed) = &self.relayed_end {
+            self.relayed_close = relayed.poll_close(cx);
+        }
+
         loop {
             tracing::trace!(connection.state = ?self.inner.state);
             // TODO: probably clean up this glob of code
@@ -308,11 +543,34 @@ where
                             // This will also handle flushing `self.codec`
                             ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
 
-                            if (self.inner.error.is_some()
+                            // Each relayed GOAWAY goes once the frames queued before it went.
+                            if let Some(go_away) =
+                                self.relayed_end.as_ref().and_then(RelayedEnd::take_go_away)
+                            {
+                                self.inner.as_dyn().relay_go_away(
+                                    go_away.last_stream_id.into(),
+                                    go_away.error_code.into(),
+                                    go_away.debug_data,
+                                    &go_away.refused,
+                                );
+                                self.relayed_unsent = Some(go_away.number);
+                                continue;
+                            }
+
+                            if ((self.inner.error.is_some() && !self.leave_close_to_client)
                                 || self.inner.go_away.should_close_on_idle())
                                 && !self.inner.streams.has_streams()
                             {
                                 self.inner.as_dyn().go_away_now(Reason::NO_ERROR);
+                                continue;
+                            }
+
+                            if self.relayed_close
+                                && !self.inner.go_away.is_sending()
+                                && !self.inner.streams.has_streams()
+                            {
+                                self.inner.state =
+                                    State::Closing(Reason::NO_ERROR, Initiator::Library);
                                 continue;
                             }
 
@@ -337,6 +595,63 @@ where
         }
     }
 
+    /// Writes a deferred preface: its SETTINGS (the configured one when `frames` has
+    /// none) and the frames after it, ahead of everything buffered meanwhile, and applies
+    /// the SETTINGS as this connection's own.
+    fn send_preface(&mut self, frames: Vec<PrefaceFrame>) -> Result<(), Error> {
+        let mut settings = self
+            .inner
+            .settings
+            .replace_pending_local(frame::Settings::default());
+        let mut front = BytesMut::new();
+        let mut window = None;
+        let mut sent_settings = false;
+        for frame in frames {
+            match frame {
+                PrefaceFrame::Settings(params) => {
+                    let params = frame::sent_params(&params, self.max_concurrent_streams, true);
+                    settings.set_wire(params).map_err(|_| {
+                        Error::library_go_away_data(
+                            Reason::INTERNAL_ERROR,
+                            "invalid_preface_settings",
+                        )
+                    })?;
+                    settings.encode(&mut front);
+                    sent_settings = true;
+                }
+                PrefaceFrame::WindowUpdate(incr) => {
+                    frame::WindowUpdate::new(StreamId::zero(), incr).encode(&mut front);
+                    window = Some(window.unwrap_or(0) + incr);
+                }
+                PrefaceFrame::Unknown {
+                    kind,
+                    flags,
+                    stream_id,
+                    payload,
+                } => {
+                    front.put_uint(payload.len() as u64, 3);
+                    front.put_u8(kind);
+                    front.put_u8(flags);
+                    front.put_u32(stream_id);
+                    front.put(payload);
+                }
+            }
+        }
+        if !sent_settings {
+            let mut first = BytesMut::new();
+            settings.encode(&mut first);
+            first.unsplit(front);
+            front = first;
+        }
+        self.inner
+            .streams
+            .apply_preface(&settings, window)
+            .map_err(Error::library_go_away)?;
+        self.inner.settings.replace_pending_local(settings);
+        self.codec.release_writes(front);
+        Ok(())
+    }
+
     fn poll2(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         // This happens outside of the loop to prevent needing to do a clock
         // check and then comparison of the queue possibly multiple times a
@@ -359,27 +674,35 @@ where
                         return Poll::Ready(Err(Error::library_go_away(reason)));
                     }
                 }
-                // Only NO_ERROR should be waiting for idle
-                debug_assert_eq!(
-                    reason,
-                    Reason::NO_ERROR,
+                // Only NO_ERROR should be waiting for idle, but a relayed GOAWAY's
+                debug_assert!(
+                    reason == Reason::NO_ERROR || self.inner.go_away.is_relayed(),
                     "graceful GOAWAY should be NO_ERROR"
                 );
             }
+            self.apply_relayed_windows();
             ready!(self.poll_ready(cx))?;
+            ready!(self.poll_relay(cx))?;
+            // No more frames while the data received waits to be taken (see
+            // `Recv::poll_buffered_room`).
+            ready!(self.inner.streams.poll_buffered_room(cx));
 
-            match self
-                .inner
-                .as_dyn()
-                .recv_frame(ready!(Pin::new(&mut self.codec).poll_next(cx)?))?
+            let frame = ready!(Pin::new(&mut self.codec).poll_next(cx)?);
+            if let (Some(relay), Some(Frame::Settings(_) | Frame::Ping(_))) = (&self.relay, &frame)
             {
+                self.inner.set_forwarding(relay);
+            }
+            match self.inner.as_dyn().recv_frame(frame)? {
                 ReceivedFrame::Settings(frame) => {
-                    self.inner.settings.recv_settings(
+                    if self.inner.settings.recv_settings(
                         frame,
                         &mut self.codec,
                         &mut self.inner.streams,
-                    )?;
+                    )? {
+                        self.relay_acked(RelayedAck::Settings);
+                    }
                 }
+                ReceivedFrame::RelayedAck(ack) => self.relay_acked(ack),
                 ReceivedFrame::Continue => (),
                 ReceivedFrame::Done => {
                     return Poll::Ready(Ok(()));
@@ -391,6 +714,12 @@ where
     fn clear_expired_reset_streams(&mut self) {
         self.inner.streams.clear_expired_reset_streams();
     }
+
+    fn relay_acked(&self, ack: RelayedAck) {
+        if let Some(relay) = &self.relay {
+            relay.acked(ack);
+        }
+    }
 }
 
 impl<P, B> ConnectionInner<P, B>
@@ -398,6 +727,22 @@ where
     P: Peer,
     B: Buf,
 {
+    /// Tells whether the client's SETTINGS and PINGs from now on go to the relaying peer,
+    /// and whether they await its ACKs, which it returns: those sent before its first
+    /// request (its preface's) are acknowledged here, the relaying peer having acknowledged
+    /// its own peer's, unless logged after `Relay::forward_from_now`.
+    fn set_forwarding(&mut self, relay: &Relay) -> bool {
+        let forwards =
+            !self.streams.as_dyn().last_processed_id().is_zero() || relay.forwards_latest();
+        let relays_acks = relay.relays_acks() && forwards;
+        self.settings.set_relays_acks(relays_acks, forwards);
+        self.ping_pong.set_relays_acks(relays_acks, forwards);
+        if relay.releases_pings() {
+            self.ping_pong.release_awaiting();
+        }
+        relays_acks
+    }
+
     fn as_dyn(&mut self) -> DynConnection<'_, B> {
         let ConnectionInner {
             state,
@@ -428,20 +773,60 @@ where
         self.go_away.go_away(frame);
     }
 
-    fn go_away_now(&mut self, e: Reason) {
+    /// Sends a GOAWAY relayed from another connection (see `RelayedEnd::go_away`), `refused`
+    /// sorted.
+    fn relay_go_away(
+        &mut self,
+        last_stream_id: StreamId,
+        reason: Reason,
+        debug_data: Bytes,
+        refused: &[u32],
+    ) {
+        // The latest stream the client opened that the other connection didn't leave
+        // unprocessed went on regardless.
+        let mut processed = self.streams.last_processed_id();
+        while processed > last_stream_id && refused.binary_search(&u32::from(processed)).is_ok() {
+            processed = StreamId::from(u32::from(processed).saturating_sub(2));
+        }
+        let last_stream_id = last_stream_id.max(processed);
+        let last_stream_id = self
+            .go_away
+            .going_away()
+            .map_or(last_stream_id, |going_away| {
+                last_stream_id.min(going_away.last_processed_id())
+            });
+        self.streams.send_go_away(last_stream_id);
+        self.go_away.relay(frame::GoAway::with_debug_data(
+            last_stream_id,
+            reason,
+            debug_data,
+        ));
+        self.streams.refuse(last_stream_id, refused);
+    }
+
+    /// The last stream a GOAWAY sent now names: the latest processed, but not past the one
+    /// a GOAWAY sent before named, which a relayed one can set below it.
+    fn go_away_id(&self) -> StreamId {
         let last_processed_id = self.streams.last_processed_id();
-        let frame = frame::GoAway::new(last_processed_id, e);
+        self.go_away
+            .going_away()
+            .map_or(last_processed_id, |going_away| {
+                last_processed_id.min(going_away.last_processed_id())
+            })
+    }
+
+    fn go_away_now(&mut self, e: Reason) {
+        let frame = frame::GoAway::new(self.go_away_id(), e);
         self.go_away.go_away_now(frame);
     }
 
     fn go_away_now_data(&mut self, e: Reason, data: Bytes) {
-        let last_processed_id = self.streams.last_processed_id();
-        let frame = frame::GoAway::with_debug_data(last_processed_id, e, data);
+        let frame = frame::GoAway::with_debug_data(self.go_away_id(), e, data);
         self.go_away.go_away_now(frame);
     }
 
     fn go_away_from_user(&mut self, e: Reason) {
-        let last_processed_id = self.streams.last_processed_id();
+        let last_processed_id = self.go_away_id();
         let frame = frame::GoAway::new(last_processed_id, e);
         self.go_away.go_away_from_user(frame);
 
@@ -571,15 +956,22 @@ where
             }
             Some(Ping(frame)) => {
                 tracing::trace!(?frame, "recv PING");
-                let status = self.ping_pong.recv_ping(frame);
-                if status.is_shutdown() {
-                    assert!(
-                        self.go_away.is_going_away(),
-                        "received unexpected shutdown ping"
-                    );
+                match self.ping_pong.recv_ping(frame) {
+                    ReceivedPing::Shutdown => {
+                        assert!(
+                            self.go_away.is_going_away(),
+                            "received unexpected shutdown ping"
+                        );
 
-                    let last_processed_id = self.streams.last_processed_id();
-                    self.go_away(last_processed_id, Reason::NO_ERROR);
+                        let last_processed_id = self.go_away_id();
+                        self.go_away(last_processed_id, Reason::NO_ERROR);
+                    }
+                    ReceivedPing::Relayed(payload) => {
+                        return Ok(ReceivedFrame::RelayedAck(RelayedAck::Ping(payload)));
+                    }
+                    ReceivedPing::MustAck
+                    | ReceivedPing::Unknown
+                    | ReceivedPing::AwaitsRelayedAck => {}
                 }
             }
             Some(WindowUpdate(frame)) => {
@@ -602,6 +994,8 @@ where
 
 enum ReceivedFrame {
     Settings(frame::Settings),
+    /// The peer's ACK of a relayed frame.
+    RelayedAck(RelayedAck),
     Continue,
     Done,
 }
@@ -659,6 +1053,12 @@ where
     fn drop(&mut self) {
         // Ignore errors as this indicates that the mutex is poisoned.
         let _ = self.inner.streams.recv_eof(true);
+        if let Some(relay) = &self.relay {
+            relay.close();
+        }
+        if let Some(relayed) = &self.relayed_end {
+            relayed.sent(u64::MAX);
+        }
     }
 }
 

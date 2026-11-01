@@ -1,3 +1,4 @@
+use crate::ext::{BodyFrames, FrameLog, HeaderBlockEncoding, HeadersFrame, LoggedFrame};
 use crate::frame::{self, Frame, Kind, Reason};
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
@@ -8,7 +9,7 @@ use crate::hpack;
 
 use futures_core::Stream;
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 
 use std::io;
 
@@ -33,6 +34,13 @@ pub struct FramedRead<T> {
     max_continuation_frames: usize,
 
     partial: Option<Partial>,
+
+    /// Logs the peer's frames, when recording them.
+    frame_log: Option<FrameLog>,
+
+    /// A frame read and not yet decoded, as the log's read gate holds it (see
+    /// `FrameLog::gate_reads`).
+    gated: Option<BytesMut>,
 }
 
 /// Partially loaded headers frame
@@ -64,7 +72,15 @@ impl<T> FramedRead<T> {
             max_header_list_size,
             max_continuation_frames,
             partial: None,
+            frame_log: None,
+            gated: None,
         }
+    }
+
+    /// Logs every frame the peer sends but DATA to `log`, and attaches `log` to each
+    /// HEADERS frame.
+    pub fn set_frame_log(&mut self, log: FrameLog) {
+        self.frame_log = Some(log);
     }
 
     pub fn get_ref(&self) -> &T {
@@ -124,6 +140,7 @@ fn decode_frame(
     max_header_list_size: usize,
     max_continuation_frames: usize,
     partial_inout: &mut Option<Partial>,
+    frame_log: Option<&FrameLog>,
     mut bytes: BytesMut,
 ) -> Result<Option<Frame>, Error> {
     let span = tracing::trace_span!("FramedRead::decode_frame", offset = bytes.len());
@@ -142,6 +159,23 @@ fn decode_frame(
     let kind = head.kind();
 
     tracing::trace!(frame.kind = ?kind);
+
+    // SETTINGS as sent, unknown identifiers included, which the frame drops.
+    let settings = match (frame_log, kind) {
+        (Some(_), Kind::Settings) => Some(LoggedFrame::Settings {
+            ack: head.flag() & 0x1 == 0x1,
+            params: bytes[frame::HEADER_LEN..]
+                .chunks_exact(6)
+                .map(|p| {
+                    (
+                        u16::from_be_bytes([p[0], p[1]]),
+                        u32::from_be_bytes([p[2], p[3], p[4], p[5]]),
+                    )
+                })
+                .collect(),
+        }),
+        _ => None,
+    };
 
     macro_rules! header_block {
         ($frame:ident, $head:ident, $bytes:ident) => ({
@@ -167,7 +201,7 @@ fn decode_frame(
             let is_end_headers = frame.is_end_headers();
 
             // Load the HPACK encoded headers
-            match frame.load_hpack(&mut payload, max_header_list_size, hpack) {
+            match frame.load_hpack(&mut payload, max_header_list_size, hpack, true) {
                 Ok(_) => {},
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {},
                 Err(frame::Error::MalformedMessage) => {
@@ -253,6 +287,10 @@ fn decode_frame(
             .into()
         }
         Kind::GoAway => {
+            if !head.stream_id().is_zero() {
+                proto_err!(conn: "GOAWAY on stream {:?}", head.stream_id());
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
             let res = frame::GoAway::load(&bytes[frame::HEADER_LEN..]);
             res.map_err(|e| {
                 proto_err!(conn: "failed to load GO_AWAY frame; err={:?}", e);
@@ -317,6 +355,10 @@ fn decode_frame(
                 }
             }
 
+            if let Continuable::Headers(headers) = &mut partial.frame {
+                headers.push_fragment(bytes.len() - frame::HEADER_LEN);
+            }
+
             // Extend the buf
             if partial.buf.is_empty() {
                 partial.buf = bytes.split_off(frame::HEADER_LEN);
@@ -375,12 +417,102 @@ fn decode_frame(
             }
         }
         Kind::Unknown => {
+            if let Some(log) = frame_log {
+                let payload = Bytes::copy_from_slice(&bytes[frame::HEADER_LEN..]);
+                log.push(LoggedFrame::Unknown {
+                    kind: bytes[3],
+                    flags: head.flag(),
+                    stream_id: head.stream_id().into(),
+                    length: payload.len() as u32,
+                    payload,
+                });
+            }
             // Unknown frames are ignored
             return Ok(None);
         }
     };
 
+    let mut frame = frame;
+    if let Some(log) = frame_log {
+        log_frame(log, &mut frame, settings);
+    }
+
     Ok(Some(frame))
+}
+
+/// Logs a decoded frame, attaches the log to a HEADERS frame, and keeps the body of the
+/// message it opens (see [`HeadersFrame::body`]).
+fn log_frame(log: &FrameLog, frame: &mut Frame, settings: Option<LoggedFrame>) {
+    let logged = match frame {
+        Frame::Settings(_) => settings,
+        Frame::WindowUpdate(f) => Some(LoggedFrame::WindowUpdate {
+            stream_id: f.stream_id().into(),
+            increment: f.size_increment(),
+        }),
+        Frame::Priority(f) => Some(LoggedFrame::Priority {
+            stream_id: f.stream_id().into(),
+            priority: f.dependency().to_ext(),
+        }),
+        Frame::Headers(f) => {
+            let stream_id = f.stream_id().into();
+            let (encoding, body) = match log.kept_body(stream_id, f.is_end_stream()) {
+                Some(kept) => {
+                    if let Some(body) = BodyFrames::upgrade(&kept) {
+                        body.set_trailers(f.take_encoding());
+                    }
+                    (HeaderBlockEncoding::default(), BodyFrames::default())
+                }
+                None if f.is_end_stream() => (f.take_encoding(), BodyFrames::default()),
+                None => (f.take_encoding(), log.open_body(stream_id)),
+            };
+            let received = HeadersFrame {
+                stream_id,
+                priority: f.stream_dep().map(|dep| dep.to_ext()),
+                pseudo_order: f.pseudo_order().to_vec(),
+                never_indexed: f.never_indexed().to_vec(),
+                encoding,
+                body,
+                connection: log.clone(),
+            };
+            let logged = LoggedFrame::Headers {
+                stream_id: received.stream_id,
+                end_stream: f.is_end_stream(),
+                priority: received.priority,
+                pseudo_order: received.pseudo_order.clone(),
+            };
+            f.set_received(received);
+            Some(logged)
+        }
+        Frame::Ping(f) => Some(LoggedFrame::Ping {
+            ack: f.is_ack(),
+            payload: *f.payload(),
+        }),
+        Frame::Reset(f) => {
+            log.kept_body(f.stream_id().into(), true);
+            Some(LoggedFrame::Reset {
+                stream_id: f.stream_id().into(),
+                error_code: f.reason().into(),
+            })
+        }
+        Frame::GoAway(f) => Some(LoggedFrame::GoAway {
+            last_stream_id: f.last_stream_id().into(),
+            error_code: f.reason().into(),
+            debug_data: f.debug_data().clone(),
+        }),
+        Frame::Data(f) => {
+            let kept = log.kept_body(f.stream_id().into(), f.is_end_stream());
+            if let Some(body) = kept.as_ref().and_then(BodyFrames::upgrade) {
+                if !body.push_data(f.payload().len(), f.pad_len(), f.is_end_stream()) {
+                    f.set_padding_unrecorded();
+                }
+            }
+            None
+        }
+        Frame::PushPromise(_) => None,
+    };
+    if let Some(logged) = logged {
+        log.push(logged);
+    }
 }
 
 impl<T> Stream for FramedRead<T>
@@ -394,11 +526,23 @@ where
         let _e = span.enter();
         loop {
             tracing::trace!("poll");
-            let bytes = match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
-                Some(Ok(bytes)) => bytes,
-                Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
-                None => return Poll::Ready(None),
+            let bytes = match self.gated.take() {
+                Some(bytes) => bytes,
+                None => match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
+                    Some(Ok(bytes)) => bytes,
+                    Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
+                    None => return Poll::Ready(None),
+                },
             };
+            // The gate holds every frame but DATA, which flow control and the received data
+            // awaiting release (`Recv::poll_buffered_room`) bound.
+            if let Some(log) = &self.frame_log {
+                if frame::Head::parse(&bytes).kind() != Kind::Data && log.poll_gate(cx).is_pending()
+                {
+                    self.gated = Some(bytes);
+                    return Poll::Pending;
+                }
+            }
 
             tracing::trace!(read.bytes = bytes.len());
             let Self {
@@ -406,6 +550,7 @@ where
                 max_header_list_size,
                 ref mut partial,
                 max_continuation_frames,
+                ref frame_log,
                 ..
             } = *self;
             if let Some(frame) = decode_frame(
@@ -413,6 +558,7 @@ where
                 max_header_list_size,
                 max_continuation_frames,
                 partial,
+                frame_log.as_ref(),
                 bytes,
             )? {
                 tracing::debug!(?frame, "received");
@@ -450,6 +596,7 @@ impl Continuable {
         }
     }
 
+    /// Decodes the header block's next fragment, a CONTINUATION frame's.
     fn load_hpack(
         &mut self,
         src: &mut BytesMut,
@@ -457,8 +604,12 @@ impl Continuable {
         decoder: &mut hpack::Decoder,
     ) -> Result<(), frame::Error> {
         match *self {
-            Continuable::Headers(ref mut h) => h.load_hpack(src, max_header_list_size, decoder),
-            Continuable::PushPromise(ref mut p) => p.load_hpack(src, max_header_list_size, decoder),
+            Continuable::Headers(ref mut h) => {
+                h.load_hpack(src, max_header_list_size, decoder, false)
+            }
+            Continuable::PushPromise(ref mut p) => {
+                p.load_hpack(src, max_header_list_size, decoder, false)
+            }
         }
     }
 }

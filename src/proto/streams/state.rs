@@ -301,7 +301,7 @@ impl State {
             Closed(..) => {}
             _ => {
                 tracing::trace!("handle_error; err={:?}", err);
-                self.inner = Closed(Cause::Error(err.clone()));
+                self.inner = Closed(self.error_cause(err.clone()));
             }
         }
     }
@@ -311,14 +311,26 @@ impl State {
             Closed(..) => {}
             ref state => {
                 tracing::trace!("recv_eof; state={:?}", state);
-                self.inner = Closed(Cause::Error(
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "stream closed because of a broken pipe",
-                    )
-                    .into(),
-                ));
+                self.inner = Closed(
+                    self.error_cause(
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "stream closed because of a broken pipe",
+                        )
+                        .into(),
+                    ),
+                );
             }
+        }
+    }
+
+    /// Why it closes with `error`: past the END_STREAM it received, if it did, which its
+    /// receive half keeps, as at a received reset.
+    fn error_cause(&self, error: Error) -> Cause {
+        if self.is_recv_end_stream() {
+            Cause::ErrorAfterEndStream(error)
+        } else {
+            Cause::Error(error)
         }
     }
 
@@ -358,6 +370,15 @@ impl State {
 
     pub fn is_scheduled_reset(&self) -> bool {
         matches!(self.inner, Closed(Cause::ScheduledLibraryReset(..)))
+    }
+
+    /// The reason the user reset the stream with, its RST_STREAM queued behind the frames
+    /// it had queued (see `Send::send_reset`).
+    pub fn get_user_reset(&self) -> Option<Reason> {
+        match self.inner {
+            Closed(Cause::Error(Error::Reset(_, reason, Initiator::User))) => Some(reason),
+            _ => None,
+        }
     }
 
     pub fn is_local_error(&self) -> bool {

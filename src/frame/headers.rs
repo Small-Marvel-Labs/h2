@@ -1,13 +1,17 @@
 use super::{util, StreamDependency, StreamId};
-use crate::ext::Protocol;
+use crate::ext::{
+    EncodedField, FieldRepresentation, HeaderBlockEncoding, HeaderOrder, HeadersFrame, Protocol,
+    PseudoHeader,
+};
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
 
 use http::header::{self, HeaderName, HeaderValue};
 use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::Cursor;
 use std::ops::ControlFlow;
@@ -86,10 +90,29 @@ pub struct Iter {
     fields: header::IntoIter<HeaderValue>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct HeaderBlock {
     /// The decoded header fields
     fields: HeaderMap,
+
+    /// The header fields' names in block order, as decoded or to encode them in
+    order: HeaderOrder,
+
+    /// The pseudo-header fields in block order, as decoded
+    pseudo_order: Vec<PseudoHeader>,
+
+    /// The pseudo-header fields decoded from never-indexed literals
+    never_indexed: Vec<PseudoHeader>,
+
+    /// How the frame was received, for a connection recording its peer's frames
+    received: Option<Box<HeadersFrame>>,
+
+    /// How the block went on the wire, as decoded
+    encoding: HeaderBlockEncoding,
+
+    /// How to encode it, when as a block another connection received went (see
+    /// [`HeaderBlockEncoding`])
+    send_as: Option<Box<HeaderBlockEncoding>>,
 
     /// Precomputed size of all of our header fields, for perf reasons
     field_size: usize,
@@ -102,9 +125,25 @@ struct HeaderBlock {
     pseudo: Pseudo,
 }
 
+// Frames compare by their fields, as a `HeaderMap` does, whatever order they came in.
+impl PartialEq for HeaderBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.fields == other.fields
+            && self.field_size == other.field_size
+            && self.is_over_size == other.is_over_size
+            && self.pseudo == other.pseudo
+    }
+}
+
+impl Eq for HeaderBlock {}
+
 #[derive(Debug)]
 struct EncodingHeaderBlock {
     hpack: BytesMut,
+    /// The HEADERS frame's pad length, to pad it with.
+    padding: Option<u8>,
+    /// The lengths of the fragments still to send, the room in each frame aside.
+    fragments: VecDeque<usize>,
 }
 
 const END_STREAM: u8 = 0x1;
@@ -124,6 +163,12 @@ impl Headers {
             header_block: HeaderBlock {
                 field_size: calculate_headermap_size(&fields),
                 fields,
+                order: HeaderOrder::default(),
+                pseudo_order: Vec::new(),
+                never_indexed: Vec::new(),
+                received: None,
+                encoding: HeaderBlockEncoding::default(),
+                send_as: None,
                 is_over_size: false,
                 pseudo,
             },
@@ -141,6 +186,12 @@ impl Headers {
             header_block: HeaderBlock {
                 field_size: calculate_headermap_size(&fields),
                 fields,
+                order: HeaderOrder::default(),
+                pseudo_order: Vec::new(),
+                never_indexed: Vec::new(),
+                received: None,
+                encoding: HeaderBlockEncoding::default(),
+                send_as: None,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
             },
@@ -205,6 +256,16 @@ impl Headers {
             stream_dep,
             header_block: HeaderBlock {
                 fields: HeaderMap::new(),
+                order: HeaderOrder::default(),
+                pseudo_order: Vec::new(),
+                never_indexed: Vec::new(),
+                received: None,
+                encoding: HeaderBlockEncoding {
+                    padding: flags.is_padded().then_some(pad as u8),
+                    fragments: vec![src.len()],
+                    ..HeaderBlockEncoding::default()
+                },
+                send_as: None,
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -215,13 +276,16 @@ impl Headers {
         Ok((headers, src))
     }
 
+    /// Decodes the header block's next fragment, its first when `first`.
     pub fn load_hpack(
         &mut self,
         src: &mut BytesMut,
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
+        first: bool,
     ) -> Result<(), Error> {
-        self.header_block.load(src, max_header_list_size, decoder)
+        self.header_block
+            .load(src, max_header_list_size, decoder, first)
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -250,6 +314,59 @@ impl Headers {
 
     pub fn into_parts(self) -> (Pseudo, HeaderMap) {
         (self.header_block.pseudo, self.header_block.fields)
+    }
+
+    /// Takes the decoded header fields' names in block order.
+    pub(crate) fn take_header_order(&mut self) -> HeaderOrder {
+        std::mem::take(&mut self.header_block.order)
+    }
+
+    /// Encodes the header fields in `order`.
+    pub(crate) fn set_header_order(&mut self, order: HeaderOrder) {
+        self.header_block.order = order;
+    }
+
+    /// The decoded pseudo-header fields in block order.
+    pub(crate) fn pseudo_order(&self) -> &[PseudoHeader] {
+        &self.header_block.pseudo_order
+    }
+
+    /// The decoded pseudo-header fields that came as never-indexed literals.
+    pub(crate) fn never_indexed(&self) -> &[PseudoHeader] {
+        &self.header_block.never_indexed
+    }
+
+    pub(crate) fn stream_dep(&self) -> Option<&StreamDependency> {
+        self.stream_dep.as_ref()
+    }
+
+    /// Attaches how the frame was received, for the request it opens.
+    pub(crate) fn set_received(&mut self, received: HeadersFrame) {
+        self.header_block.received = Some(Box::new(received));
+    }
+
+    /// How the frame was received, when attached (see [`Self::set_received`]).
+    pub(crate) fn received(&self) -> Option<&HeadersFrame> {
+        self.header_block.received.as_deref()
+    }
+
+    pub(crate) fn take_received(&mut self) -> Option<HeadersFrame> {
+        self.header_block.received.take().map(|received| *received)
+    }
+
+    /// Notes a CONTINUATION frame's fragment of `len` octets of the block.
+    pub(crate) fn push_fragment(&mut self, len: usize) {
+        self.header_block.encoding.fragments.push(len);
+    }
+
+    /// Takes how the block went on the wire.
+    pub(crate) fn take_encoding(&mut self) -> HeaderBlockEncoding {
+        std::mem::take(&mut self.header_block.encoding)
+    }
+
+    /// Encodes the block, and lays it out in frames, as `encoding` says.
+    pub(crate) fn set_encoding(&mut self, encoding: HeaderBlockEncoding) {
+        self.header_block.send_as = Some(Box::new(encoding));
     }
 
     #[cfg(feature = "unstable")]
@@ -285,9 +402,9 @@ impl Headers {
         // Get the HEADERS frame head
         let head = self.head();
 
-        self.header_block
-            .into_encoding(encoder)
-            .encode(&head, dst, Some(encoder), |_| {})
+        let mut encoding = self.header_block.into_encoding(encoder);
+        let padding = encoding.padding.take();
+        encoding.encode(&head, dst, Some(encoder), padding, |_| {})
     }
 
     fn head(&self) -> Head {
@@ -366,6 +483,12 @@ impl PushPromise {
             header_block: HeaderBlock {
                 field_size: calculate_headermap_size(&fields),
                 fields,
+                order: HeaderOrder::default(),
+                pseudo_order: Vec::new(),
+                never_indexed: Vec::new(),
+                received: None,
+                encoding: HeaderBlockEncoding::default(),
+                send_as: None,
                 is_over_size: false,
                 pseudo,
             },
@@ -456,6 +579,12 @@ impl PushPromise {
             flags,
             header_block: HeaderBlock {
                 fields: HeaderMap::new(),
+                order: HeaderOrder::default(),
+                pseudo_order: Vec::new(),
+                never_indexed: Vec::new(),
+                received: None,
+                encoding: HeaderBlockEncoding::default(),
+                send_as: None,
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -466,13 +595,16 @@ impl PushPromise {
         Ok((frame, src))
     }
 
+    /// Decodes the header block's next fragment, its first when `first`.
     pub fn load_hpack(
         &mut self,
         src: &mut BytesMut,
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
+        first: bool,
     ) -> Result<(), Error> {
-        self.header_block.load(src, max_header_list_size, decoder)
+        self.header_block
+            .load(src, max_header_list_size, decoder, first)
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -495,6 +627,16 @@ impl PushPromise {
         self.header_block.is_over_size
     }
 
+    /// Encodes the header fields in `order`.
+    pub(crate) fn set_header_order(&mut self, order: HeaderOrder) {
+        self.header_block.order = order;
+    }
+
+    /// Encodes the block, and lays it out in frames, as `encoding` says.
+    pub(crate) fn set_encoding(&mut self, encoding: HeaderBlockEncoding) {
+        self.header_block.send_as = Some(Box::new(encoding));
+    }
+
     pub fn encode(
         self,
         encoder: &mut hpack::Encoder,
@@ -506,11 +648,11 @@ impl PushPromise {
         let head = self.head();
         let promised_id = self.promised_id;
 
-        self.header_block
-            .into_encoding(encoder)
-            .encode(&head, dst, Some(encoder), |dst| {
-                dst.put_u32(promised_id.into());
-            })
+        let mut encoding = self.header_block.into_encoding(encoder);
+        let padding = encoding.padding.take();
+        encoding.encode(&head, dst, Some(encoder), padding, |dst| {
+            dst.put_u32(promised_id.into());
+        })
     }
 
     fn head(&self) -> Head {
@@ -551,7 +693,7 @@ impl Continuation {
         // Get the CONTINUATION frame head
         let head = self.head();
 
-        self.header_block.encode(&head, dst, None, |_| {})
+        self.header_block.encode(&head, dst, None, None, |_| {})
     }
 }
 
@@ -647,11 +789,14 @@ impl Pseudo {
 // ===== impl EncodingHeaderBlock =====
 
 impl EncodingHeaderBlock {
+    /// Encodes a frame of `head` carrying the next fragment, padded by `padding` when the
+    /// frame has room for it, `f` writing what comes before the fragment.
     fn encode<F>(
         mut self,
         head: &Head,
         dst: &mut EncodeBuf<'_>,
         encoder: Option<&mut hpack::Encoder>,
+        padding: Option<u8>,
         f: F,
     ) -> Option<Continuation>
     where
@@ -666,11 +811,26 @@ impl EncodingHeaderBlock {
 
         let payload_pos = dst.get_ref().len();
 
+        // Its length octet, then the padding, take room the fragment then lacks.
+        let padding = padding.filter(|&pad| usize::from(pad) < dst.remaining_mut());
+        if let Some(pad) = padding {
+            dst.put_u8(pad);
+            dst.get_mut()[head_pos + 4] |= PADDED;
+        }
+        let pad = padding.map_or(0, usize::from);
+
         f(dst);
 
         // Now, encode the header payload
-        let continuation = if self.hpack.len() > dst.remaining_mut() {
-            let head_part = self.hpack.split_to(dst.remaining_mut());
+        let room = dst.remaining_mut() - pad;
+        // The last fragment recorded takes the rest of a block grown since.
+        let len = match self.fragments.pop_front() {
+            Some(len) if !self.fragments.is_empty() => len.min(room),
+            _ => room,
+        };
+        // A block that fits goes on in the fragments recorded after it, empty past its end.
+        let continuation = if self.hpack.len() > len || !self.fragments.is_empty() {
+            let head_part = self.hpack.split_to(len.min(self.hpack.len()));
             dst.put_slice(&head_part);
 
             Some(Continuation {
@@ -687,6 +847,7 @@ impl EncodingHeaderBlock {
 
             None
         };
+        dst.put_bytes(0, pad);
 
         // Compute the header block length
         let payload_len = (dst.get_ref().len() - payload_pos) as u64;
@@ -709,6 +870,21 @@ impl EncodingHeaderBlock {
 }
 
 // ===== impl Iter =====
+
+/// The name of `header`, a pseudo-header field, with its colon.
+fn pseudo_name(header: &hpack::Header<Option<HeaderName>>) -> &'static [u8] {
+    use crate::hpack::Header::*;
+
+    match header {
+        Method(_) => b":method",
+        Scheme(_) => b":scheme",
+        Authority(_) => b":authority",
+        Path(_) => b":path",
+        Protocol(_) => b":protocol",
+        Status(_) => b":status",
+        Field { .. } => b"",
+    }
+}
 
 impl Iterator for Iter {
     type Item = hpack::Header<Option<HeaderName>>;
@@ -864,6 +1040,7 @@ impl HeaderBlock {
         src: &mut BytesMut,
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
+        first: bool,
     ) -> Result<(), Error> {
         let mut reg = !self.fields.is_empty();
         let mut malformed = false;
@@ -889,7 +1066,7 @@ impl HeaderBlock {
         }
 
         macro_rules! set_pseudo {
-            ($field:ident, $val:expr) => {{
+            ($field:ident, $id:ident, $val:expr, $never_indexed:expr) => {{
                 if reg {
                     tracing::trace!("load_hpack; header malformed -- pseudo not at head of block");
                     malformed = true;
@@ -905,6 +1082,10 @@ impl HeaderBlock {
                     }
                     if !self.is_over_size {
                         self.pseudo.$field = Some(__val);
+                        self.pseudo_order.push(PseudoHeader::$id);
+                        if $never_indexed {
+                            self.never_indexed.push(PseudoHeader::$id);
+                        }
                     }
                 }
             }};
@@ -916,8 +1097,25 @@ impl HeaderBlock {
         // the headers. A malformed header frame is a stream level error, but
         // the hpack state is connection level. In order to maintain correct
         // state for other streams, the hpack decoding process must complete.
-        let res = decoder.decode(&mut cursor, |header| {
+        let res = decoder.decode_fragment(&mut cursor, first, |header, representation| {
             use crate::hpack::Header::*;
+
+            use crate::ext::LiteralIndexing;
+
+            let never_indexed = matches!(
+                representation,
+                FieldRepresentation::Literal {
+                    indexing: LiteralIndexing::Never,
+                    ..
+                }
+            );
+            // Recorded once known well-formed and within the list size, which charges it,
+            // so that a malformed block's fields, which it doesn't, take no memory.
+            let recorded = (!self.is_over_size && !malformed).then(|| EncodedField {
+                name: Bytes::copy_from_slice(header.name().as_slice()),
+                value: Bytes::copy_from_slice(header.value_slice()),
+                representation,
+            });
 
             match header {
                 Field { name, value } => {
@@ -948,25 +1146,45 @@ impl HeaderBlock {
                         }
                         if !self.is_over_size {
                             self.field_size += header_size;
-                            if let Err(_) = self.fields.try_append(name, value) {
+                            if let Err(_) = self.fields.try_append(name.clone(), value) {
                                 // HeaderMap capacity exceeded — treat as over-size
                                 // so the stream is rejected downstream (RST_STREAM / 431)
                                 // instead of panicking on the 24,577th unique header.
                                 self.is_over_size = true;
+                            } else {
+                                self.order.0.push(name);
                             }
                         }
                     }
                 }
-                Authority(v) => set_pseudo!(authority, v),
-                Method(v) => set_pseudo!(method, v),
-                Scheme(v) => set_pseudo!(scheme, v),
-                Path(v) => set_pseudo!(path, v),
-                Protocol(v) => set_pseudo!(protocol, v),
-                Status(v) => set_pseudo!(status, v),
+                Authority(v) => set_pseudo!(authority, Authority, v, never_indexed),
+                Method(v) => set_pseudo!(method, Method, v, never_indexed),
+                Scheme(v) => set_pseudo!(scheme, Scheme, v, never_indexed),
+                Path(v) => set_pseudo!(path, Path, v, never_indexed),
+                Protocol(v) => set_pseudo!(protocol, Protocol, v, never_indexed),
+                Status(v) => set_pseudo!(status, Status, v, never_indexed),
+            }
+
+            if let Some(field) = recorded.filter(|_| !malformed && !self.is_over_size) {
+                self.encoding.fields.push(field);
             }
 
             ControlFlow::Continue(())
         });
+
+        let (size_updates, octets) = decoder.take_size_updates();
+        for size in size_updates {
+            hpack::push_size_update(&mut self.encoding.size_updates, size);
+        }
+        // Size updates count toward the list's size by the octets they took, so a block
+        // of nothing else is bounded as one of fields is.
+        self.field_size += octets;
+        headers_size += octets;
+        if headers_size > max_header_list_abuse_size {
+            header_list_way_too_large = true;
+        } else if headers_size >= max_header_list_size {
+            self.is_over_size = true;
+        }
 
         match res {
             Ok(()) => {}
@@ -992,14 +1210,61 @@ impl HeaderBlock {
     fn into_encoding(self, encoder: &mut hpack::Encoder) -> EncodingHeaderBlock {
         let mut hpack = encoder.take_scratch();
         hpack.clear();
-        let headers = Iter {
-            pseudo: Some(self.pseudo),
-            fields: self.fields.into_iter(),
+        // A `HeaderMap` can't hold repeats interleaved with other names, so fields in a
+        // recorded order are encoded from a list.
+        let (fields, ordered) = if self.order.0.is_empty() {
+            (self.fields, Vec::new())
+        } else {
+            let ordered = ordered_fields(&self.fields, &self.order.0);
+            (HeaderMap::new(), ordered)
         };
+        let ordered = ordered
+            .into_iter()
+            .map(|(name, value)| hpack::Header::Field {
+                name: Some(name),
+                value,
+            });
+        let mut pseudo: Vec<_> = Iter {
+            pseudo: Some(self.pseudo),
+            fields: HeaderMap::new().into_iter(),
+        }
+        .collect();
+        // The pseudo-header fields go in the order recorded.
+        if let Some(encoding) = &self.send_as {
+            pseudo.sort_by_key(|header| {
+                encoding
+                    .fields
+                    .iter()
+                    .position(|field| field.name == pseudo_name(header))
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let headers = pseudo
+            .into_iter()
+            .chain(Iter {
+                pseudo: None,
+                fields: fields.into_iter(),
+            })
+            .chain(ordered);
 
-        encoder.encode(headers, &mut hpack);
-
-        EncodingHeaderBlock { hpack }
+        match self.send_as {
+            Some(encoding) => {
+                encoder.encode_as(headers, &encoding, &mut hpack);
+                EncodingHeaderBlock {
+                    hpack,
+                    padding: encoding.padding,
+                    fragments: encoding.fragments.into(),
+                }
+            }
+            None => {
+                encoder.encode(headers, &mut hpack);
+                EncodingHeaderBlock {
+                    hpack,
+                    padding: None,
+                    fragments: VecDeque::new(),
+                }
+            }
+        }
     }
 
     /// Calculates the size of the currently decoded header list.
@@ -1027,6 +1292,28 @@ impl HeaderBlock {
             + pseudo_size!(path)
             + self.field_size
     }
+}
+
+/// `fields` in `order`, each listed name taking the next value of that name, then the
+/// values `order` doesn't list, in map order.
+fn ordered_fields(fields: &HeaderMap, order: &[HeaderName]) -> Vec<(HeaderName, HeaderValue)> {
+    let mut values = HashMap::new();
+    let mut out = Vec::with_capacity(fields.len());
+    for name in order {
+        let listed = values
+            .entry(name)
+            .or_insert_with_key(|name| fields.get_all(*name).iter());
+        if let Some(value) = listed.next() {
+            out.push((name.clone(), value.clone()));
+        }
+    }
+    for name in fields.keys() {
+        let rest = values
+            .remove(name)
+            .unwrap_or_else(|| fields.get_all(name).iter());
+        out.extend(rest.map(|value| (name.clone(), value.clone())));
+    }
+    out
 }
 
 fn calculate_headermap_size(map: &HeaderMap) -> usize {
@@ -1292,7 +1579,12 @@ mod test {
         let mut decoder = hpack::Decoder::new(4096);
         const DEFAULT_MAX_HEADER_LIST_SIZE: usize = 16 << 20; // 16 MB
         headers
-            .load_hpack(&mut hpack_data, DEFAULT_MAX_HEADER_LIST_SIZE, &mut decoder)
+            .load_hpack(
+                &mut hpack_data,
+                DEFAULT_MAX_HEADER_LIST_SIZE,
+                &mut decoder,
+                true,
+            )
             .expect("load_hpack should return Ok");
 
         // Verify that is_over_size was set (try_append returned Err)
@@ -1344,5 +1636,37 @@ mod test {
                 }
             );
         }
+    }
+
+    #[test]
+    fn ordered_fields_take_listed_values_then_the_rest() {
+        let mut fields = HeaderMap::new();
+        for (name, value) in [
+            ("x", "1"),
+            ("y", "a"),
+            ("x", "2"),
+            ("x", "3"),
+            ("z", "q"),
+            ("y", "b"),
+        ] {
+            fields.append(name, HeaderValue::from_static(value));
+        }
+        let order = ["y", "x", "w", "x", "y", "y"].map(HeaderName::from_static);
+        let fields: Vec<_> = ordered_fields(&fields, &order)
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_owned()))
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                ("y", "a"),
+                ("x", "1"),
+                ("x", "2"),
+                ("y", "b"),
+                ("x", "3"),
+                ("z", "q")
+            ]
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        );
     }
 }
